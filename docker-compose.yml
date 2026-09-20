@@ -14,6 +14,7 @@
 #   export GATEKEEPER_SVC_TOKEN=<gatekeeper token>       # gatekeeper
 #   export CP_INVALIDATE_TOKEN=<gatekeeper token>        # controlplane (same value)
 #   export RECEIPT_FANIN_TOKEN=<receipt-service token>   # controlplane (usage fan-in)
+#   export BILLING_SVC_TOKEN=<from seed_tokens>
 # Then `docker compose up --build`.
 #
 # Key-authority cutover: the gatekeeper and receipt service only talk to the
@@ -74,6 +75,36 @@ services:
     volumes:
       - controlplane-data:/data
     command: ["python", "-m", "services.controlplane.app"]
+
+  # Phase 5 — billing (:9004). Stripe TEST MODE only: without
+  # STRIPE_TEST_SECRET_KEY it boots an explicitly labeled offline mock
+  # backend (no real charges possible). With sk_test_* set it talks to
+  # Stripe test mode; non-sk_test_* keys are refused at startup.
+  # Webhooks verified (t=,v1= HMAC, 300s tolerance), idempotent.
+  billing:
+    build: .
+    network_mode: host
+    depends_on:
+      controlplane:
+        condition: service_started
+      receipts:
+        condition: service_healthy
+    environment:
+      BILLING_PORT: "9004"
+      BILLING_DB: /data/billing.db
+      CONTROLPLANE_URL: http://127.0.0.1:9002
+      RECEIPT_SVC_URL: http://127.0.0.1:9001
+      # Service tokens from `python3 -m services.controlplane.seed_tokens`:
+# BILLING_SVC_TOKEN: <redacted>
+# RECEIPT_SVC_TOKEN: <redacted>
+      # Optional Stripe test mode (leave unset for the offline mock):
+# STRIPE_TEST_SECRET_KEY: <redacted>
+# STRIPE_TEST_WEBHOOK_SECRET: <redacted>
+# STRIPE_PRICE_PRO: <redacted>
+# STRIPE_PRICE_TEAM: <redacted>
+    volumes:
+      - billing-data:/data
+    command: ["python", "-m", "services.billing.app"]
 
   upstream:
     build: .
@@ -150,4 +181,5 @@ volumes:
   tenants-data: # shared tenant registry (gatekeeper + receipt service, v1 file mode)
   receipts-data: # SQLite receipt database
   controlplane-data: # SQLite control-plane database (tenants, keys, policies)
+  billing-data: # SQLite billing database (customers, subs, webhook idempotency)
   spool-data: # gatekeeper local fallback log (durable spool of record)

@@ -15,6 +15,17 @@ dashboard against this revision.
 tenant API key, server-rendered UI + `/api/*` JSON + SSE relay, 18/18 tests
 green, `demo/dashboard_walkthrough.sh` green. No §4 contract was changed.
 
+**Amendment 2026-09-20 (Phase 5):** billing built on `phase5-billing`
+(`services/billing/`, :9004) against the contracts above — Stripe test mode
+only (offline mock backend by default, explicitly labeled; real backend
+refuses non-`sk_test_*` keys and requires a webhook secret), signed webhook
+verification (300s tolerance, idempotent events), tenant-isolated
+checkout/portal/subscription views, usage-metered quotas from the receipt
+service, and over-quota reconcile that suspends through the control plane
+(only billing-owned suspensions auto-reverse; operator suspensions are never
+claimed or lifted). 20/20 billing tests green, full suite 168/168,
+`demo/billing_walkthrough.sh` green. No §4 contract was changed.
+
 **Non-goals for this spec:** marketing copy, pricing page design, production hardening
 (KMS, Postgres, multi-region). Local-first; see §10.
 
@@ -30,7 +41,7 @@ green, `demo/dashboard_walkthrough.sh` green. No §4 contract was changed.
 | control plane | `services/controlplane/` | 9002 | Crew A | to build |
 | agent runner | `services/runner/` | 9003 | Crew A | to build |
 | dashboard | `web/dashboard/` | 3000 | Crew B | **built (Phase 4)** |
-| billing | `services/billing/` | 9004 | Crew B | to build |
+| billing | `services/billing/` | 9004 | Crew B | **built (Phase 5)** |
 
 All services speak HTTP+JSON. Inter-service auth: bearer service tokens (see §8).
 External tenants authenticate with `vouch_sk_*` API keys (see §8).
@@ -152,7 +163,7 @@ Known contract gaps (documented in `web/dashboard/app.py`, no contract changed):
 G1 — no tenant-facing monthly usage *history* (only current-month fan-in);
 G2 — no tenant-facing deployment *logs* (status/heartbeat/container_id only).
 
-### 2.7 billing (`services/billing/`, :9004) — Crew B
+### 2.7 billing (`services/billing/`, :9004) — Crew B — BUILT (Phase 5)
 
 Stripe **test mode only**. Plan catalog (configurable, defaults):
 `free` $0 — 10k actions/mo; `pro` $49/mo — 1M actions/mo; `team` $199/mo —
@@ -540,7 +551,11 @@ entirely in the UI.
 ### Phase 5 — billing (Crew B; needs Phase 1 usage API — stub it until then)
 Stripe test mode: checkout, portal, webhooks → plan updates; quota display.
 Crew A (small): wire `tenants.status='suspended'` → gatekeeper deny-all via key bundle.
-**Exit:** test-mode subscribe → plan flips → over-quota tenant gets deny-all receipts.
+**Exit (met 2026-09-20 — 20/20 billing tests green, full suite 168/168,
+`demo/billing_walkthrough.sh` green):** mock subscribe → plan flips on the
+control plane → over-quota reconcile suspends the tenant (deny-all enforced by
+the gatekeeper from the key-bundle `status`, §4.3) → cancel → back to Free →
+new month lifts billing's suspension.
 
 ### Phase 6 — docs, SDKs, quickstart (Crew B)
 `docs/` (concepts, API reference from §4, self-host guide), `sdks/python|js`
