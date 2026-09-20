@@ -17,7 +17,12 @@ Endpoints:
     GET  /v1/policies                    tenant key
     PUT  /v1/policies/{task_id}          tenant key  (422 on invalid rules)
     DELETE /v1/policies/{task_id}        tenant key
-    POST /v1/deployments                  tenant key
+    POST /v1/deployments                  tenant key  (body: task_id,
+                                             agent_image, optional
+                                             mode 'service'|'one-shot';
+                                             one-shot exits are terminal:
+                                             clean -> 'succeeded', else
+                                             'failed', never restarted)
     GET  /v1/deployments                  tenant key
     GET  /v1/deployments/{id}            tenant key
     DELETE /v1/deployments/{id}          tenant key  (-> stopped)
@@ -459,7 +464,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._too_large()
         try:
             result = self.db.create_deployment(
-                t["id"], body.get("task_id", ""), body.get("agent_image", ""))
+                t["id"], body.get("task_id", ""), body.get("agent_image", ""),
+                mode=body.get("mode", "service"))
         except (ValueError, KeyError) as e:
             return self._err(400, "bad_request", str(e))
         self._send(201, result)

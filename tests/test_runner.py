@@ -312,6 +312,67 @@ class TestRunnerReconcile(unittest.TestCase):
         self.assertEqual(summary["started"], ["dep_ab12cd34"])
         self.assertEqual(len(docker.started_specs), 2)
 
+    def _exit_proc(self, code):
+        class Exited:
+            def __init__(self, rc):
+                self._rc = rc
+            def poll(self):
+                return self._rc
+            def terminate(self):
+                pass
+        return Exited(code)
+
+    def test_one_shot_clean_exit_reports_succeeded_and_never_restarts(self):
+        cp, docker, runner = self.make([desired_running(mode="one-shot")])
+        runner.reconcile_once()
+        n_specs = len(docker.started_specs)
+        # the one-shot agent finished: container exited with code 0
+        docker.containers["dep_ab12cd34"]["proc"] = self._exit_proc(0)
+        cp.reports.clear()
+        summary = runner.reconcile_once()
+        self.assertEqual(summary["succeeded"], ["dep_ab12cd34"])
+        self.assertEqual(summary["started"], [],
+                         "a completed one-shot must never restart")
+        self.assertEqual(len(docker.started_specs), n_specs)
+        self.assertNotIn("dep_ab12cd34", docker.containers,
+                         "exited one-shot container is removed")
+        self.assertIn(("dep_ab12cd34", "succeeded", cp.reports[-1][2]),
+                      cp.reports)
+
+    def test_one_shot_crash_reports_failed_and_never_restarts(self):
+        cp, docker, runner = self.make([desired_running(mode="one-shot")])
+        runner.reconcile_once()
+        docker.containers["dep_ab12cd34"]["proc"] = self._exit_proc(1)
+        cp.reports.clear()
+        summary = runner.reconcile_once()
+        self.assertEqual(summary["failed"], ["dep_ab12cd34"])
+        self.assertEqual(summary["started"], [],
+                         "a crashed one-shot must never restart")
+        self.assertEqual(len(docker.started_specs), 1)
+        self.assertIn(("dep_ab12cd34", "failed", cp.reports[-1][2]),
+                      cp.reports)
+
+    def test_one_shot_still_running_heartbeats(self):
+        cp, docker, runner = self.make([desired_running(mode="one-shot")])
+        runner.reconcile_once()
+        cp.reports.clear()
+        summary = runner.reconcile_once()
+        self.assertEqual(summary["heartbeats"], 1)
+        self.assertEqual(summary["succeeded"], [])
+        self.assertEqual(summary["started"], [])
+        self.assertEqual(cp.reports[0][1], "running")
+
+    def test_service_mode_with_clean_exit_still_restarts(self):
+        # supervisor semantics are unchanged for service mode: even a
+        # clean exit is replaced (a service that stops is a service down).
+        cp, docker, runner = self.make([desired_running(mode="service")])
+        runner.reconcile_once()
+        docker.containers["dep_ab12cd34"]["proc"] = self._exit_proc(0)
+        summary = runner.reconcile_once()
+        self.assertEqual(summary["started"], ["dep_ab12cd34"])
+        self.assertEqual(summary["succeeded"], [])
+        self.assertEqual(len(docker.started_specs), 2)
+
     def test_stop_desired_stopped(self):
         cp, docker, runner = self.make([desired_running()])
         runner.reconcile_once()

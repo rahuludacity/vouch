@@ -244,9 +244,21 @@ Presented key format `vouch_sk_<32 hex chars>`; only `sha256(presented)` is stor
 ### deployments
 ```
 id TEXT PK, tenant_id TEXT, task_id TEXT, agent_image TEXT,
-status TEXT ('pending'|'running'|'stopped'|'failed'),
+mode TEXT ('service'|'one-shot', default 'service'),
+status TEXT ('pending'|'running'|'succeeded'|'stopped'|'failed'),
 container_id TEXT NULL, last_heartbeat REAL NULL, created_at REAL
 ```
+
+Lifecycle (§2.5/§4.5): the runner polls `GET /internal/desired-state`
+(`pending`/`running` → desired `running`, anything else → `stopped`).
+`service` deployments are supervised: an exited container is replaced.
+`one-shot` deployments run exactly once: when their container exits, a
+clean exit (code 0) moves the deployment to the terminal `succeeded`
+state, any other exit to `failed`; the container is removed and never
+restarted (a completed one-shot that restarts is the receipt-chain
+inflation bug). `succeeded` also revokes the deployment's gatekeeper
+credential (H-1). `POST /v1/deployments` accepts optional
+`mode` (`service` default).
 
 ### usage_monthly
 ```

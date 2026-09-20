@@ -297,6 +297,62 @@ class TestControlPlaneModels(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.db.create_deployment(tid, "x", "")
 
+    def test_deployment_one_shot_mode_and_succeeded_terminal_state(self):
+        t = self.db.create_tenant("Oneshot")
+        tid = t["tenant_id"]
+        d = self.db.create_deployment(tid, "run-once",
+                                      "vouch/agent-demo:latest",
+                                      mode="one-shot")
+        self.assertEqual(d["mode"], "one-shot")
+        self.assertIsNotNone(self.db.get_deployment_token(
+            d["deployment_id"]))
+        row = [r for r in self.db.desired_state()
+               if r["id"] == d["deployment_id"]][0]
+        self.assertEqual(row["mode"], "one-shot")
+        self.assertEqual(row["desired"], "running")
+        # the terminal state: accepted, and desired flips to stopped so the
+        # runner never restarts it; the credential dies with the run.
+        self.assertTrue(self.db.set_deployment_status(
+            d["deployment_id"], "succeeded", container_id="c9"))
+        self.assertEqual(
+            self.db.get_deployment(tid, d["deployment_id"])["status"],
+            "succeeded")
+        row = [r for r in self.db.desired_state()
+               if r["id"] == d["deployment_id"]][0]
+        self.assertEqual(row["desired"], "stopped")
+        self.assertIsNone(self.db.get_deployment_token(d["deployment_id"]))
+        with self.assertRaises(ValueError):
+            self.db.create_deployment(tid, "x", "img", mode="bogus")
+        # legacy default stays service
+        d2 = self.db.create_deployment(tid, "svc", "img")
+        self.assertEqual(d2["mode"], "service")
+
+    def test_legacy_db_without_mode_column_migrates(self):
+        # A pre-fix database has no `mode` column; opening it must add the
+        # column with the service default instead of breaking.
+        import sqlite3
+        path = os.path.join(self.tmp, "legacy.db")
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE deployments (id TEXT PRIMARY KEY,"
+            " tenant_id TEXT NOT NULL, task_id TEXT NOT NULL,"
+            " agent_image TEXT NOT NULL, status TEXT NOT NULL"
+            " DEFAULT 'pending', container_id TEXT, last_heartbeat REAL,"
+            " created_at REAL NOT NULL)")
+        conn.execute(
+            "INSERT INTO deployments (id, tenant_id, task_id, agent_image,"
+            " status, created_at) VALUES ('dep_legacy', 't1', 'job',"
+            " 'img', 'running', 1.0)")
+        conn.commit()
+        conn.close()
+        from services.controlplane.models import ControlPlaneDB
+        db = ControlPlaneDB(path)
+        row = db.get_deployment_any("dep_legacy")
+        self.assertEqual(row["mode"], "service")
+        desired = [r for r in db.desired_state()
+                   if r["id"] == "dep_legacy"][0]
+        self.assertEqual(desired["desired"], "running")
+
 
 # ------------------------------------------------- unit: key bundle cache
 class _BundleHandler(BaseHTTPRequestHandler):

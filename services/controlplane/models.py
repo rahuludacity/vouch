@@ -21,7 +21,12 @@ from gatekeeper import policy_v2
 
 PLANS = ("free", "pro", "team")
 STATUSES = ("active", "suspended")
-DEPLOYMENT_STATUSES = ("pending", "running", "stopped", "failed")
+DEPLOYMENT_STATUSES = ("pending", "running", "succeeded", "stopped", "failed")
+# Deployment run modes. "service" = long-lived: the runner replaces an
+# exited container (supervisor semantics). "one-shot" = run exactly once:
+# a clean container exit transitions the deployment to the terminal
+# "succeeded" state (any other exit -> "failed") and is never restarted.
+DEPLOYMENT_MODES = ("service", "one-shot")
 
 API_KEY_PREFIX = "vouch_sk_"
 SVC_TOKEN_PREFIX = "vouch_svc_"
@@ -72,6 +77,7 @@ CREATE TABLE IF NOT EXISTS deployments (
   tenant_id TEXT NOT NULL REFERENCES tenants(id),
   task_id TEXT NOT NULL,
   agent_image TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'service',
   status TEXT NOT NULL DEFAULT 'pending',
   container_id TEXT,
   last_heartbeat REAL,
@@ -169,6 +175,15 @@ class ControlPlaneDB:
             # WAL mode: readers never block writers (L-3 robustness fix).
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(SCHEMA)
+            # Migration (2026-09-20): one-shot lifecycle fix adds the
+            # `mode` column to deployments. CREATE TABLE IF NOT EXISTS never
+            # alters an existing table, so backfill it explicitly.
+            cols = [r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(deployments)").fetchall()]
+            if "mode" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE deployments ADD COLUMN"
+                    " mode TEXT NOT NULL DEFAULT 'service'")
             self._conn.commit()
         os.chmod(self.path, 0o600)
 
@@ -545,37 +560,42 @@ class ControlPlaneDB:
             (_utcnow(), deployment_id),
         )
 
-    def create_deployment(self, tenant_id, task_id, agent_image):
+    def create_deployment(self, tenant_id, task_id, agent_image, mode="service"):
         if not isinstance(task_id, str) or not task_id.strip():
             raise ValueError("task_id must be a non-empty string")
         if not isinstance(agent_image, str) or not agent_image.strip():
             raise ValueError("agent_image must be a non-empty string")
+        if mode not in DEPLOYMENT_MODES:
+            raise ValueError(
+                f"unknown deployment mode '{mode}'"
+                f" (allowed: {', '.join(DEPLOYMENT_MODES)})")
         if not self.get_tenant(tenant_id):
             raise KeyError(f"unknown tenant '{tenant_id}'")
         dep_id = "dep_" + secrets.token_hex(8)
         self._write(
             "INSERT INTO deployments (id, tenant_id, task_id, agent_image,"
-            " status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
-            (dep_id, tenant_id, task_id.strip(), agent_image.strip(), _utcnow()),
+            " mode, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            (dep_id, tenant_id, task_id.strip(), agent_image.strip(),
+             mode, _utcnow()),
         )
         # H-1: every deployment gets its gatekeeper credential at creation.
         # Shown once here; the runner re-fetches it via the scoped internal
         # credential endpoint for container injection.
         token = self.mint_deployment_token(dep_id, tenant_id)
-        return {"deployment_id": dep_id, "status": "pending",
+        return {"deployment_id": dep_id, "mode": mode, "status": "pending",
                 "deployment_token": token}
 
     def get_deployment_any(self, dep_id):
         """Deployment row regardless of tenant (internal, scoped)."""
         return self._one(
-            "SELECT id, tenant_id, task_id, agent_image, status, container_id,"
+            "SELECT id, tenant_id, task_id, agent_image, mode, status, container_id,"
             " last_heartbeat, created_at FROM deployments WHERE id = ?",
             (dep_id,),
         )
 
     def list_deployments(self, tenant_id):
         return self._all(
-            "SELECT id, task_id, agent_image, status, container_id,"
+            "SELECT id, task_id, agent_image, mode, status, container_id,"
             " last_heartbeat, created_at FROM deployments WHERE tenant_id = ?"
             " ORDER BY created_at",
             (tenant_id,),
@@ -583,7 +603,7 @@ class ControlPlaneDB:
 
     def get_deployment(self, tenant_id, dep_id):
         return self._one(
-            "SELECT id, task_id, agent_image, status, container_id,"
+            "SELECT id, task_id, agent_image, mode, status, container_id,"
             " last_heartbeat, created_at FROM deployments"
             " WHERE id = ? AND tenant_id = ?",
             (dep_id, tenant_id),
@@ -608,12 +628,18 @@ class ControlPlaneDB:
             " last_heartbeat = ? WHERE id = ?",
             (status, container_id, _utcnow(), dep_id),
         )
+        if cur.rowcount and status == "succeeded":
+            # One-shot terminal state: the run is complete, so its
+            # gatekeeper credential dies with it (H-1, same principle as
+            # stop_deployment). No restart, no reuse.
+            self.revoke_deployment_token(dep_id)
         return cur.rowcount > 0
 
     def desired_state(self):
         """What the runner should converge to (§4.5 internal)."""
         rows = self._all(
-            "SELECT id, tenant_id, task_id, agent_image, status FROM deployments"
+            "SELECT id, tenant_id, task_id, agent_image, mode, status"
+            " FROM deployments"
         )
         return [
             {
@@ -621,6 +647,7 @@ class ControlPlaneDB:
                 "tenant_id": r["tenant_id"],
                 "task_id": r["task_id"],
                 "agent_image": r["agent_image"],
+                "mode": r["mode"],
                 "desired": "running"
                 if r["status"] in ("pending", "running")
                 else "stopped",

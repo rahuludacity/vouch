@@ -155,7 +155,11 @@ class DockerBackend:
         return self.sandbox_network
 
     def list_managed(self):
-        """{dep_id: {"id": container_id, "running": bool}} for our containers."""
+        """{dep_id: {"id", "running", "exit_code"}} for our containers.
+
+        exit_code is None while running or when unknown; for exited
+        containers it is the container's exit status (0 = clean exit).
+        """
         out = {}
         try:
             containers = self.client.containers.list(
@@ -170,7 +174,15 @@ class DockerBackend:
                 running = c.status == "running"
             except Exception:
                 running = False
-            out[dep_id] = {"id": c.id, "running": running}
+            exit_code = None
+            if not running:
+                try:
+                    c.reload()
+                    exit_code = (c.attrs.get("State") or {}).get("ExitCode")
+                except Exception:
+                    exit_code = None
+            out[dep_id] = {"id": c.id, "running": running,
+                           "exit_code": exit_code}
         return out
 
     def start(self, spec):
@@ -222,8 +234,19 @@ class FakeDockerBackend:
         return proc.poll() is None
 
     def list_managed(self):
-        return {dep_id: {"id": info["id"], "running": self._alive(info)}
+        return {dep_id: {"id": info["id"], "running": self._alive(info),
+                         "exit_code": self._exit_code(info)}
                 for dep_id, info in self.containers.items()}
+
+    def _exit_code(self, info):
+        """Exit status of an exited "container", else None."""
+        proc = info.get("proc")
+        if proc is None:
+            return None
+        try:
+            return proc.poll()  # None while still running
+        except Exception:
+            return None
 
     def start(self, spec):
         validate_spec(spec, sandbox_network=self.sandbox_network)
@@ -284,9 +307,16 @@ class Runner:
             self._log(f"remove {container_id} ({dep_id}): {e}")
 
     def reconcile_once(self):
-        """One converge pass. Returns a summary dict; never raises."""
+        """One converge pass. Returns a summary dict; never raises.
+
+        Lifecycle: "service" deployments are supervisors — an exited
+        container is replaced. "one-shot" deployments run exactly once:
+        when their container exits, a clean exit (code 0) transitions the
+        deployment to the terminal "succeeded" state, any other exit to
+        "failed"; the container is removed and never restarted.
+        """
         summary = {"started": [], "stopped": [], "heartbeats": 0,
-                   "failed": [], "errors": []}
+                   "succeeded": [], "failed": [], "errors": []}
         try:
             desired = self.cp.get_desired_state()
         except ControlPlaneError as e:
@@ -305,7 +335,8 @@ class Runner:
 
         want = {d["id"]: d for d in desired if d.get("id")}
 
-        # 1. desired running -> ensure a live container (start / restart / heartbeat)
+        # 1. desired running -> ensure a live container
+        #    (start / restart / heartbeat / one-shot terminal)
         for dep_id, dep in want.items():
             if dep.get("desired") != "running":
                 continue
@@ -315,6 +346,20 @@ class Runner:
                 summary["heartbeats"] += 1
                 continue
             if cur and not cur["running"]:
+                if dep.get("mode") == "one-shot":
+                    # Terminal: a one-shot runs exactly once. Clean exit
+                    # (code 0) -> "succeeded"; anything else (crash, unknown
+                    # exit code) -> "failed". Never restart — restarting a
+                    # completed one-shot is the receipt-chain inflation bug.
+                    exit_code = cur.get("exit_code")
+                    terminal = ("succeeded"
+                                if exit_code == 0 else "failed")
+                    self._log(f"{dep_id}: one-shot exited"
+                              f" (code {exit_code}), terminal -> {terminal}")
+                    self._remove_container(dep_id, cur["id"])
+                    self._report(dep_id, terminal, cur["id"])
+                    summary[terminal].append(dep_id)
+                    continue
                 self._log(f"{dep_id}: previous container exited, replacing")
                 self._remove_container(dep_id, cur["id"])
             try:
