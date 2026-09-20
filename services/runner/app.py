@@ -148,7 +148,11 @@ class DockerBackend:
         self.sandbox_network = sandbox_network
 
     def ensure_network(self):
-        return ensure_sandbox_network(self.client)
+        # Adopt the real network name (ensure_sandbox_network may adopt the
+        # compose-created vouch_vouch-sandbox); the spec builder must use
+        # THIS name, not the bare SANDBOX_NETWORK default.
+        self.sandbox_network = ensure_sandbox_network(self.client)
+        return self.sandbox_network
 
     def list_managed(self):
         """{dep_id: {"id": container_id, "running": bool}} for our containers."""
@@ -320,7 +324,9 @@ class Runner:
                 dep_token = self.cp.get_deployment_credential(dep_id)
                 spec = build_container_spec(
                     dep, gatekeeper_url=self.gatekeeper_agent_url,
-                    deployment_token=dep_token)
+                    deployment_token=dep_token,
+                    sandbox_network=getattr(self.docker, "sandbox_network",
+                                            SANDBOX_NETWORK))
                 cid = self.docker.start(spec)
             except Exception as e:
                 summary["failed"].append(dep_id)

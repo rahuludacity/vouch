@@ -61,7 +61,7 @@ def agent_id_for(dep_id):
 
 
 def build_container_spec(deployment, gatekeeper_url=DEFAULT_GATEKEEPER_AGENT_URL,
-                         deployment_token=None):
+                         deployment_token=None, sandbox_network=SANDBOX_NETWORK):
     """Build the docker-SDK ``containers.run`` spec for one deployment.
 
     ``deployment``: mapping with ``id``, ``tenant_id``, ``task_id``,
@@ -85,7 +85,10 @@ def build_container_spec(deployment, gatekeeper_url=DEFAULT_GATEKEEPER_AGENT_URL
         "name": container_name(dep_id),
         # No host networking, ever. The internal sandbox network carries only
         # the gatekeeper besides this agent (the egress allowlist).
-        "network": SANDBOX_NETWORK,
+        # NOTE: use the *adopted* network name (ensure_sandbox_network may
+        # adopt the compose-created vouch_vouch-sandbox instead of creating
+        # the bare name) — never hardcode SANDBOX_NETWORK here.
+        "network": sandbox_network,
         "environment": {
             "GATEKEEPER_URL": gatekeeper_url,
             "VOUCH_TENANT_ID": str(deployment["tenant_id"]),
@@ -119,19 +122,19 @@ def build_container_spec(deployment, gatekeeper_url=DEFAULT_GATEKEEPER_AGENT_URL
         },
         "restart_policy": {"Name": "unless-stopped"},
     }
-    validate_spec(spec)
+    validate_spec(spec, sandbox_network=sandbox_network)
     return spec
 
 
-def validate_spec(spec):
+def validate_spec(spec, sandbox_network=SANDBOX_NETWORK):
     """Reject any spec that violates the sandbox contract. Raises ValueError."""
     if not isinstance(spec, dict):
         raise ValueError("spec must be a dict")
     if spec.get("network_mode") == "host" or spec.get("network") == "host":
         raise ValueError("host networking is forbidden for agent containers")
-    if spec.get("network") != SANDBOX_NETWORK:
+    if spec.get("network") != sandbox_network:
         raise ValueError(
-            f"agent containers must attach to {SANDBOX_NETWORK!r}, "
+            f"agent containers must attach to {sandbox_network!r}, "
             f"got {spec.get('network')!r}"
         )
     if spec.get("privileged"):
