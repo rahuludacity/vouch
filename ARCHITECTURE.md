@@ -10,6 +10,11 @@ blessed as the canonical contract; this document now reflects the tested impleme
 (phase2 branch, 107/107 tests green on a fresh clone, 2026-09-20). Crew B builds the
 dashboard against this revision.
 
+**Amendment 2026-09-20 (Phase 4):** dashboard built on `phase4-dashboard`
+(`web/dashboard/`, :3000) against the contracts above — session auth on the
+tenant API key, server-rendered UI + `/api/*` JSON + SSE relay, 18/18 tests
+green, `demo/dashboard_walkthrough.sh` green. No §4 contract was changed.
+
 **Non-goals for this spec:** marketing copy, pricing page design, production hardening
 (KMS, Postgres, multi-region). Local-first; see §10.
 
@@ -24,7 +29,7 @@ dashboard against this revision.
 | receipt service | `services/receipts/` | 9001 | Crew A | to build |
 | control plane | `services/controlplane/` | 9002 | Crew A | to build |
 | agent runner | `services/runner/` | 9003 | Crew A | to build |
-| dashboard | `web/dashboard/` | 3000 | Crew B | to build |
+| dashboard | `web/dashboard/` | 3000 | Crew B | **built (Phase 4)** |
 | billing | `services/billing/` | 9004 | Crew B | to build |
 
 All services speak HTTP+JSON. Inter-service auth: bearer service tokens (see §8).
@@ -118,12 +123,34 @@ for desired state; reports status back. Injects `GATEKEEPER_URL`, `VOUCH_TENANT_
 `VOUCH_TASK_ID`, `VOUCH_AGENT_ID` into the agent environment so the agent's MCP
 client routes through the gatekeeper with correct identity headers.
 
-### 2.6 dashboard (`web/dashboard/`, :3000) — Crew B
+### 2.6 dashboard (`web/dashboard/`, :3000) — Crew B — BUILT (Phase 4)
 
 Live action feed, audit trail search, policy editor, tenant/key management,
 deployment controls, usage/billing views. Talks **only** to the control plane and
-receipt service REST APIs with the tenant API key. Must run against stub servers
-implementing §4 until Crew A ships — stubs are Crew B's responsibility.
+receipt service REST APIs with the tenant API key, per the frozen §4 contracts —
+no new upstream endpoints were invented.
+
+Auth: the tenant API key (`vouch_sk_*`) is the single credential. The operator
+pastes it once on the login page; the dashboard validates it against
+`GET /v1/tenants/me` and keeps it server-side in an in-memory session map
+(random 256-bit session id, HttpOnly + SameSite=Lax cookie, 12h TTL).
+`DASHBOARD_API_KEY` env switches to single-operator mode (login skipped).
+State-changing calls carry a per-session CSRF token. Key plaintext is shown
+once on creation (the frozen `POST /v1/api-keys` contract) and never rendered
+again; signing-key material never appears anywhere (`rotate-keys` returns only
+the new `kid`, §10.5).
+
+Screens: `/overview` (tenant card + usage fan-in from `GET /v1/tenants/me` +
+chain-status banner), `/receipts` (filterable chain explorer + one-click
+`GET /v1/verify` + per-seq detail), `/policies` (viewer/editor writing v2
+schema via `PUT /v1/policies/{task}`, 422s relayed), `/deployments` (list,
+create, stop), `/keys` (named keys list/create/revoke + signing-key rotation).
+JSON mirrors live under `/api/*`; `/api/receipts/stream` relays the
+receipt-service SSE live feed with the key held server-side.
+
+Known contract gaps (documented in `web/dashboard/app.py`, no contract changed):
+G1 — no tenant-facing monthly usage *history* (only current-month fan-in);
+G2 — no tenant-facing deployment *logs* (status/heartbeat/container_id only).
 
 ### 2.7 billing (`services/billing/`, :9004) — Crew B
 
@@ -443,7 +470,11 @@ services/
     app.py             # checkout, portal, Stripe webhook (TEST MODE)
     plans.py           # plan catalog: free/pro/team quotas
 web/
-  dashboard/           # NEW (Crew B, Phase 4): feed, audit, policies, keys, deployments, usage
+  dashboard/           # Phase 4 (built): web/dashboard/app.py — server-rendered
+                       # pages (overview, receipts, policies, deployments, keys)
+                       # + /api/* JSON mirrors + SSE relay; session auth on the
+                       # tenant API key; upstream.py forwards the frozen §4 calls.
+                       # tests/test_dashboard.py (18 tests), demo/dashboard_walkthrough.sh
 docs/                  # NEW (Crew B, Phase 6)
 sdks/
   python/  js/         # NEW (Crew B, Phase 6): MCP client wrappers injecting identity headers
@@ -502,8 +533,9 @@ dashboard-visible. **Exit:** one-command e2e (`compose up` + deploy + verify).
 
 ### Phase 4 — dashboard (Crew B; starts as soon as this doc lands, against stubs)
 Live feed (SSE), audit search, policy editor (writes v2 schema), key rotation UI,
-deployment controls, usage view. **Exit:** click-through of the Phase 3 e2e entirely
-in the UI.
+deployment controls, usage view. **Exit (met 2026-09-20 — 18/18 dashboard tests
+green, `demo/dashboard_walkthrough.sh` green):** click-through of the Phase 3 e2e
+entirely in the UI.
 
 ### Phase 5 — billing (Crew B; needs Phase 1 usage API — stub it until then)
 Stripe test mode: checkout, portal, webhooks → plan updates; quota display.
