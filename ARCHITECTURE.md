@@ -3,6 +3,13 @@
 **Status:** spec. v1 (gatekeeper + per-tenant receipts) is shipped and stable; this document
 defines everything built on top of it. Two crews build against the contracts below in parallel.
 
+**Amendment 2026-09-20 (ratified by CTO decision):** Phase 2 shipped *beyond* the frozen
+surface — named API keys, usage fan-in, suspend/unsuspend endpoints, server-side push
+invalidation, tenant-scoped policy bundles (`tenant_id` required). The fuller surface is
+blessed as the canonical contract; this document now reflects the tested implementation
+(phase2 branch, 107/107 tests green on a fresh clone, 2026-09-20). Crew B builds the
+dashboard against this revision.
+
 **Non-goals for this spec:** marketing copy, pricing page design, production hardening
 (KMS, Postgres, multi-region). Local-first; see §10.
 
@@ -73,10 +80,11 @@ negotiation, `Mcp-Session-Id` relay, tenant via `X-Tenant-Id` → session bindin
    failure, fall back to the existing local `ReceiptLog` file append (current behavior).
    A background flusher retries spooled receipts; order per tenant is preserved
    (flush in seq order).
-3. Tenant keys: keep working exactly as today (file-backed `TenantRegistry`), but the
-   **key authority moves to the control plane** in Phase 2. Gatekeeper caches keys in
-   memory, refreshed from the control plane (§4.3). Until Phase 2 ships, the file
-   registry is the authority — no behavior change.
+3. Tenant keys: the **key authority is the control plane** (migrated `tenants.json` → DB,
+   kids preserved; legacy v0/v1 file registries remain as fallback). Gatekeeper caches
+   key bundles in memory with a 60s TTL (§4.3), serving the last bundle stale for up to
+   10 minutes during a control-plane outage. A tenant with no cached bundle fails closed
+   (deny, 403 unknown tenant). v0 receipts still verify unchanged.
 4. New receipt fields `rule_id`, `policy_version` (§6). Nullable; v1 receipts verify
    without them.
 
@@ -227,19 +235,32 @@ Response:
 {"tenant_id":"acme","status":"active","policy_version":7,
  "current_kid":"k3","keys":{"k1":"hex…","k2":"hex…","k3":"hex…"}}
 ```
-Gatekeeper caches per tenant, TTL 60s, and treats `status != "active"` as deny-all
-with reason `tenant suspended`. `policy_version` lets the gatekeeper detect policy
-drift (see 4.4).
-`POST /internal/cache/invalidate` `{"tenant_id":"acme"}` — control plane calls on
-rotate/suspend/plan-change; best-effort (TTL is the backstop).
+Gatekeeper caches per tenant with a 60s TTL. On fetch failure it serves the cached
+bundle stale for up to 10 minutes so enforcement never depends on a live control plane;
+a tenant with no cached bundle at all fails closed (unknown tenant → deny, 403).
+`status != "active"` is deny-all: non-MCP calls get 403 and `tools/call` is denied with
+reason `tenant suspended` — denied calls still write receipts, so suspension is auditable.
+`policy_version` (from the key bundle) lets the gatekeeper detect policy drift (see 4.4).
+`POST /internal/cache/invalidate` `{"tenant_id":"acme"}` — the control plane calls it on
+tenant create, key rotation, plan change, and suspend/unsuspend; the gatekeeper accepts
+the push with the `CONTROLPLANE_INVALIDATE_TOKEN` bearer. Best-effort server-side push —
+the 60s TTL is the backstop. Push is disabled entirely when `GATEKEEPER_URL` is unset.
 
 ### 4.4 control plane ↔ policy store (gatekeeper pulls)
 
-`GET /internal/policies/bundle?since_version=6` — service-token bearer.
+`GET /internal/policies/bundle?tenant_id=acme&since_version=6` — service-token bearer.
+`tenant_id` is **required** (ratified 2026-09-20; bundles are tenant-scoped by design):
+missing `tenant_id` → `400 bad_request`, unknown tenant → `404 unknown_tenant`.
+When nothing changed since `since_version`, the returned `version` is unchanged and
+the gatekeeper keeps its cache.
 Response: `{"version":7,"policies":{"deploy-staging":{"version":3,"rules_json":"…"},…}}`
-Gatekeeper polls every 15s; applies only if `version` advances; evaluates with
-`policy_v2`. Until Phase 2, gatekeeper uses `policy.yaml` (unchanged v1 behavior).
-Receipts record the `policy_version` that decided them.
+The gatekeeper polls every 15s per active tenant and applies a bundle only if its
+`version` advanced (policy drift is also caught per-call: `_policy_for` compares the
+key bundle's `policy_version` against the cached bundle version and refreshes on
+advance). A corrupt or unparseable bundle is discarded and the last good policy keeps
+enforcing — the enforcement hot path never raises. Until Phase 2, gatekeeper uses
+`policy.yaml` (unchanged v1 behavior). Receipts record the `policy_version` that
+decided them.
 
 **Tenant-facing policy CRUD** (dashboard uses these, tenant API key bearer):
 - `GET /v1/policies` → `{"tasks":{"deploy-staging":{"version":3,"rules":{…}},…}}`
@@ -250,14 +271,29 @@ Receipts record the `policy_version` that decided them.
 ### 4.5 control plane — tenants, keys, API keys, deployments (tenant API key bearer unless noted)
 
 - `POST /v1/tenants` `{"name":"Acme"}` → `{"tenant_id":"acme","api_key":"vouch_sk_…","plan":"free"}`
-  (api_key shown once; only the hash is stored)
-- `GET /v1/tenants/me` → `{"tenant_id","name","plan","status","usage":{"month":"2026-09","actions_allowed":…,"actions_denied":…}}`
-- `POST /v1/tenants/me/rotate-keys` → `{"new_kid":"k4"}` (old keys stay verifiable; gatekeeper cache invalidated)
-- `POST /v1/api-keys` `{"name":"ci"}` → `{"id","api_key":"vouch_sk_…"}`
-- `DELETE /v1/api-keys/{id}` → `204`
+  (api_key shown once; only the sha256 hash is stored). Tenant create fires a
+  push-invalidate so the gatekeeper picks the new tenant up immediately.
+- `GET /v1/tenants/me` → `{"tenant_id","name","plan","status","usage":{"month":"2026-09","actions_allowed":…,"actions_denied":…}}`.
+  `usage` is fanned in from the receipt service (`GET /internal/usage/{tenant_id}?month=`
+  on `RECEIPT_SVC_URL` with the fan-in bearer) — dashboard reads usage here, never from billing.
+- `POST /v1/tenants/me/rotate-keys` → `{"new_kid":"k4"}` (new kid **only** — key material
+  never leaves the server). Old kids stay verifiable (current + up to 3 retired, §3).
+  Rotation pushes a cache invalidation, so the next gated call signs with the new kid.
+- `POST /v1/api-keys` `{"name":"ci"}` → `{"id","api_key":"vouch_sk_…","name":"ci"}`
+  (plaintext shown once; only the hash is stored). Keys are **named** so CI, human, and
+  per-service keys can be told apart and revoked individually.
+- `GET /v1/api-keys` → `{"keys":[{"id","name","created_at","revoked_at"},…]}`
+  (metadata only — no hashes, no plaintext)
+- `DELETE /v1/api-keys/{id}` → `204` (revokes; subsequent calls with that key get 401)
 - `POST /v1/deployments` `{"task_id":"deploy-staging","agent_image":"vouch/agent-demo:latest"}`
   → `{"deployment_id":"dep_…","status":"pending"}`
 - `GET /v1/deployments` / `GET /v1/deployments/{id}` / `DELETE /v1/deployments/{id}` (→ stops container)
+- Internal, service-token: `GET /internal/tenants/{id}/keys` → `{"current_kid":"k3","keys":{"k1":"hex…",…}}`
+  (receipt service's verify path — the tenant-scoped twin of the gatekeeper key bundle, §4.7)
+- Internal, service-token: `POST /internal/tenants/{id}/plan` `{"plan":"pro"}` → `200`
+  (Stripe webhook hook, §4.8; `422 invalid_plan` on unknown plan; pushes invalidation)
+- Internal, service-token: `POST /internal/tenants/{id}/status` `{"status":"suspended"}` → `200`
+  (suspend/unsuspend; `422 invalid_status` on invalid status; pushes invalidation)
 - Internal, service-token: `GET /internal/desired-state` → `{"deployments":[{"id","tenant_id","task_id","agent_image","desired":"running|stopped"}]}` (runner polls 10s)
 - Internal, service-token: `POST /internal/deployments/{id}/status` `{"status":"running","container_id":"abc"}` → `200`
 
@@ -268,14 +304,22 @@ Receipts record the `policy_version` that decided them.
 - `GET /v1/receipts/{seq}` → receipt or `404`
 - `GET /v1/receipts/stream?task_id=` — **SSE**, `event: receipt` per new ingest for the tenant. Dashboard live feed subscribes here.
 - `GET /v1/verify` → `{"tenant_id","receipts":N,"chain_ok":true,"failures":[]}`
-  Chain verification is public-with-key: needs the tenant API key (keys stay server-side).
-  Signature verification runs server-side against control-plane keys (4.7); failures listed per seq.
-- Internal, service-token: `GET /internal/usage/{tenant_id}?month=YYYY-MM` → `{"actions_allowed":…,"actions_denied":…}` (billing reads this)
+  Chain verification needs the tenant API key (keys stay server-side). Signatures are
+  checked against control-plane keys (§4.7) with a 5-minute local cache; on an
+  `unknown key id` failure the cache is invalidated once, refreshed, and verification
+  retried — a key rotation can never break a legitimate verify.
+- Internal, service-token: `GET /internal/usage/{tenant_id}?month=YYYY-MM` → `{"actions_allowed":…,"actions_denied":…}` (billing and the `/v1/tenants/me` fan-in read this)
+
+**Tenant scoping (ratified 2026-09-20):** every tenant endpoint derives the tenant from
+the API key — the key *is* the tenant. An explicit `?tenant_id=` is accepted but must
+match the key's tenant, otherwise `403 forbidden`; the key's own tenant is the default.
+Service tokens pass `?tenant_id=` and it is required (missing → `400`).
 
 ### 4.7 receipt service → control plane (internal)
 
 `GET /internal/tenants/{id}/keys` — service-token bearer → `{"current_kid":"k3","keys":{"k1":"hex…",…}}`.
-Receipt service never stores key material; it fetches on verify and caches 5 min.
+Receipt service never stores key material; it fetches on verify and caches 5 min, with
+the rotation-race retry in §4.6 (invalidate once, refresh, re-verify).
 (Consolidates key authority in the control plane; gatekeeper's 4.3 bundle is the
 hot-path-optimized twin of this endpoint.)
 
@@ -427,9 +471,10 @@ the runner injects them from env; that path is unchanged.
 
 ## 9. Phased build plan + crew split
 
-**Contract freeze:** §4 is frozen as of this document. Crew B builds dashboard/billing
-against these contracts using local stubs from day one; Crew A must not break them
-without a versioned `/v2` and a note here.
+**Contract freeze:** §4 is frozen as of this document. **Amended 2026-09-20:** the fuller
+Phase 2 surface is ratified as the canonical contract (see Amendment note at top). Crew B
+builds dashboard/billing against these contracts using local stubs from day one; Crew A
+must not break them without a versioned `/v2` and a note here.
 
 ### Phase 1 — durable receipts + argument-aware policy (Crew A)
 1. `services/receipts/`: store, ingest, query, SSE stream, verify, usage counters, v1 import.
@@ -444,7 +489,11 @@ arg-constrained deny proven (e.g. `deploy_staging` with `env=prod` denied).
 Tenant API, key authority (migrate `tenants.json` → DB, kids preserved), policy CRUD
 + bundle endpoint, API keys, deployments CRUD, service tokens, suspension state.
 Gatekeeper switches to key-bundle cache (§4.3) with 60s TTL + invalidate hook.
-**Exit:** `POST /v1/tenants` → deploy policy → gated calls → receipts, all via API.
+**Exit (met 2026-09-20 — 107/107 tests green on a fresh clone, independently verified):**
+`POST /v1/tenants` → deploy policy → gated calls → receipts, all via API. Ratified
+surface includes named API keys, usage fan-in on `/v1/tenants/me`, suspend/unsuspend
+endpoints, server-side push invalidation, tenant-scoped policy bundles (`tenant_id`
+required), and tenant-scoped receipt APIs.
 
 ### Phase 3 — agent runner (Crew A)
 Docker sandbox, desired-state poll, status callbacks, env injection. E2E demo:
