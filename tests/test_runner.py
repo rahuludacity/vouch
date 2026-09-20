@@ -109,6 +109,24 @@ class TestSandboxSpec(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_spec(spec)
 
+    def test_start_accepts_adopted_compose_network_name(self):
+        # Regression (prod 2026-09-20): compose names the sandbox network
+        # vouch_vouch-sandbox; ensure_sandbox_network adopts it. The spec
+        # builder was fixed to use the adopted name, but start() still
+        # validated against the bare default and rejected every spec, so
+        # every deployment went to "failed" with no container. start()
+        # must validate against the backend's adopted network, not the
+        # default.
+        adopted = "vouch_vouch-sandbox"
+        backend = FakeDockerBackend(sandbox_network=adopted)
+        spec = build_container_spec(dep(), deployment_token=_TEST_DEP_TOKEN,
+                                    sandbox_network=adopted)
+        cid = backend.start(spec)
+        self.assertTrue(cid.startswith("fake-dep_"))
+        # ...while a spec for any other network is still rejected.
+        with self.assertRaises(ValueError):
+            backend.start(makespec())
+
     def test_validate_rejects_privileged_and_caps(self):
         spec = makespec()
         spec["privileged"] = True

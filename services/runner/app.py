@@ -174,7 +174,7 @@ class DockerBackend:
         return out
 
     def start(self, spec):
-        validate_spec(spec)
+        validate_spec(spec, sandbox_network=self.sandbox_network)
         kwargs = dict(spec)
         image = kwargs.pop("image")
         container = self.client.containers.run(image, **kwargs)
@@ -226,7 +226,7 @@ class FakeDockerBackend:
                 for dep_id, info in self.containers.items()}
 
     def start(self, spec):
-        validate_spec(spec)
+        validate_spec(spec, sandbox_network=self.sandbox_network)
         dep_id = spec["labels"]["vouch.deployment"]
         self._n += 1
         cid = f"fake-{dep_id}-{self._n}"
