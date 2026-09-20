@@ -22,7 +22,11 @@ import urllib.request
 import urllib.error
 
 GATE = os.environ.get("GATEKEEPER_URL", "http://127.0.0.1:9000/mcp")
-TENANT = os.environ.get("VOUCH_TENANT", "demo")
+# Identity: the runner injects VOUCH_*_ID env vars into the agent container
+# (§2.5); the legacy VOUCH_TENANT and the demo defaults still work.
+TENANT = os.environ.get("VOUCH_TENANT_ID") or os.environ.get("VOUCH_TENANT", "demo")
+TASK_ID = os.environ.get("VOUCH_TASK_ID", "deploy-staging")
+AGENT_ID = os.environ.get("VOUCH_AGENT_ID", "agent-001")
 
 
 def parse_sse(raw):
@@ -141,10 +145,10 @@ def run_scenario(task_id, agent_id, calls):
         print(f"  session teardown -> HTTP {e.code}")
 
 
-print(f"Scenario 1: legit staging deploy (tenant={TENANT}, task=deploy-staging)")
+print(f"Scenario 1: legit staging deploy (tenant={TENANT}, task={TASK_ID})")
 run_scenario(
-    "deploy-staging",
-    "agent-001",
+    TASK_ID,
+    AGENT_ID,
     [
         ("read_file", "read_file", {"path": "app.py"}),
         ("run_tests", "run_tests", {"suite": "unit"}),
@@ -155,8 +159,8 @@ run_scenario(
 print()
 print("Scenario 2: compromised agent tries to drop the database")
 run_scenario(
-    "deploy-staging",
-    "agent-001",
+    TASK_ID,
+    AGENT_ID,
     [("delete_database", "delete_database", {"target": "prod"})],
 )
 

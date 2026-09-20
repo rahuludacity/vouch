@@ -82,6 +82,42 @@ services:
       UPSTREAM_PORT: "9010"
     command: ["python", "demo/upstream.py"]
 
+  # Phase 3 — agent runner (:9003). Polls the control plane's desired state,
+  # runs one sandboxed container per deployment, reports status back.
+  #
+  # Sandbox topology (ARCHITECTURE.md §2.5): on startup the runner creates the
+  # docker network `vouch-sandbox` with internal=true (no route to the outside
+  # world). Agent containers attach ONLY to that network; the gatekeeper must
+  # be the only other member — that membership IS the egress allowlist
+  # ({http://gatekeeper:9000}). The gatekeeper service above uses
+  # network_mode: host, which cannot join extra networks; on a real docker
+  # host run the gatekeeper WITHOUT host mode and attach it to vouch-sandbox
+  # (uncomment the networks block below) so agents can reach it and nothing
+  # else. Until then the runner still reconciles correctly — only the
+  # sandbox-network attach of the gatekeeper is a host-topology step.
+  runner:
+    build: .
+    network_mode: host
+    depends_on:
+      controlplane:
+        condition: service_started
+    environment:
+      RUNNER_PORT: "9003"
+      CONTROLPLANE_URL: http://127.0.0.1:9002
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?}
+      # Gatekeeper MCP endpoint AS SEEN BY AGENT CONTAINERS on vouch-sandbox.
+      GATEKEEPER_AGENT_URL: http://gatekeeper:9000/mcp
+      RUNNER_POLL_INTERVAL: "10"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: ["python", "-m", "services.runner.app"]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9003/v1/health', timeout=3)"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
   gatekeeper:
     build: .
     network_mode: host
@@ -107,7 +143,7 @@ services:
     volumes:
       - tenants-data:/tenants:ro
       - spool-data:/spool
-      - ./demo/policy.yaml:/config/policy.yaml:ro
+      - ./policy.yaml:/config/policy.yaml:ro
     command: ["python", "-m", "gatekeeper.proxy"]
 
 volumes:
