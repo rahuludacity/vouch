@@ -18,8 +18,24 @@ everything it did.
 
 ## Run it
 
+**Fastest path — the whole platform in one command:**
+
 ```bash
 pip install pyyaml
+bash quickstart.sh
+```
+
+That boots the gatekeeper, receipt service, control plane, dashboard, and
+billing (mock test mode), provisions a tenant, deploys an agent, and verifies
+the signed receipt chain. Start here: **[docs/quickstart.md](docs/quickstart.md)**.
+
+Then read the [concepts](docs/concepts.md), the
+[API reference](docs/api-reference.md), and grab an SDK —
+[`sdk/python`](sdk/python) or [`sdk/js`](sdk/js).
+
+The original v1 demo still works:
+
+```bash
 bash demo/run_demo.sh
 ```
 

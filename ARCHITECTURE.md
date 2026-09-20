@@ -26,6 +26,17 @@ service, and over-quota reconcile that suspends through the control plane
 claimed or lifted). 20/20 billing tests green, full suite 168/168,
 `demo/billing_walkthrough.sh` green. No §4 contract was changed.
 
+**Amendment 2026-09-20 (Phase 6):** docs, SDKs, and quickstart built on
+`phase6-docs-sdks` against the contracts above — `docs/` (concepts,
+quickstart, API reference, troubleshooting; every example verified by
+running), `sdk/python/` (`vouch` package: `VouchClient`, `MCPClient`,
+offline `verify_chain` mirroring `verify_tenant` exactly; 19/19 tests),
+`sdk/js/` (`@vouch/sdk`: same surface on global fetch; 18/18 `node --test`),
+and `quickstart.sh` (boots gatekeeper/receipts/control-plane/dashboard/
+billing-mock, provisions a tenant, deploys an agent, verifies the chain —
+exits 0 on a fresh clone with only `pip install pyyaml`). No §4 contract
+was changed.
+
 **Non-goals for this spec:** marketing copy, pricing page design, production hardening
 (KMS, Postgres, multi-region). Local-first; see §10.
 
@@ -486,9 +497,14 @@ web/
                        # + /api/* JSON mirrors + SSE relay; session auth on the
                        # tenant API key; upstream.py forwards the frozen §4 calls.
                        # tests/test_dashboard.py (18 tests), demo/dashboard_walkthrough.sh
-docs/                  # NEW (Crew B, Phase 6)
-sdks/
-  python/  js/         # NEW (Crew B, Phase 6): MCP client wrappers injecting identity headers
+docs/                  # Phase 6: concepts, quickstart, API reference, troubleshooting
+sdk/
+  python/              # Phase 6: `vouch` pip package — VouchClient, MCPClient,
+                       #   verify_chain; tests/sdk-python (19 tests)
+  js/                  # Phase 6: `@vouch/sdk` npm package — same surface;
+                       #   node --test (18 tests)
+quickstart.sh          # Phase 6: one-command 0→1 — boots everything, provisions
+                       #   a tenant, deploys an agent, verifies the chain (exit 0)
 demo/                  # v1 demo stays; Phase 3 adds e2e demo via runner
 docker-compose.yml     # NEW (Phase 1): all services, ports §1, named volumes
 ARCHITECTURE.md        # this file
