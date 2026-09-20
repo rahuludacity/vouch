@@ -4,3 +4,5 @@ __pycache__/
 receipts.jsonl
 tenants.json
 .env
+*.db
+data/

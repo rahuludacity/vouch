@@ -32,6 +32,18 @@ Env:  GATEKEEPER_PORT           listen port (default 9000)
                                 empty disables remote ingest -> local file only)
       RECEIPT_SVC_TOKEN         bearer token for POST /v1/ingest (default "")
       RECEIPT_FLUSH_INTERVAL    flusher pass interval in seconds (default 5.0)
+      CONTROLPLANE_URL          control plane base (default ""; empty keeps the
+                                v1 file-backed tenant registry + policy.yaml)
+      GATEKEEPER_SVC_TOKEN      bearer token for control-plane internal calls
+                                (default ""); also validates the push
+                                POST /internal/cache/invalidate
+      POLICY_POLL_INTERVAL      policy bundle poll seconds (default 15)
+
+When CONTROLPLANE_URL is set, the key authority moves to the control plane
+(§4.3): per-tenant key bundles are cached with a 60s TTL and served stale
+while the control plane is down; `status != active` denies everything with
+reason "tenant suspended"; policies come from the control-plane bundle with
+the file policy as fallback. The v1 file path is untouched otherwise.
 """
 import json
 import os
@@ -43,6 +55,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import yaml
 
 from . import policy_v2
+from .controlplane import KeyBundleCache, PolicyBundleCache
 from .ingest import ReceiptEmitter
 from .receipts import ReceiptLog
 from .tenants import TenantRegistry
@@ -50,6 +63,10 @@ from .tenants import TenantRegistry
 HERE = os.path.dirname(__file__)
 LISTEN_PORT = int(os.environ.get("GATEKEEPER_PORT", "9000"))
 UPSTREAM = os.environ.get("GATEKEEPER_UPSTREAM", "http://127.0.0.1:9001/mcp")
+CONTROLPLANE_URL = os.environ.get("CONTROLPLANE_URL", "").rstrip("/")
+GATEKEEPER_SVC_TOKEN = os.environ.get("GATEKEEPER_SVC_TOKEN", "")
+POLICY_POLL_INTERVAL = float(os.environ.get("POLICY_POLL_INTERVAL", "15"))
+CP_ACTIVE = bool(CONTROLPLANE_URL)
 POLICY_PATH = os.environ.get(
     "GATEKEEPER_POLICY_PATH", os.path.join(HERE, "..", "policy.yaml")
 )
@@ -72,13 +89,24 @@ def load_policy():
 
 
 class Handler(BaseHTTPRequestHandler):
-    policy = load_policy()
-    registry = TenantRegistry(TENANTS_PATH)
-    registry.ensure("default")  # requests without X-Tenant-Id land here
-    log = ReceiptLog(RECEIPT_PATH, registry)
+    policy = load_policy()  # file policy: fallback when the control plane
+    # is off or its bundle is unavailable. Never removed.
+    if CP_ACTIVE:
+        # Key authority is the control plane (§4.3): per-tenant key bundles
+        # with 60s TTL, served stale while the control plane is down.
+        key_resolver = KeyBundleCache(CONTROLPLANE_URL, GATEKEEPER_SVC_TOKEN)
+        policy_cache = PolicyBundleCache(CONTROLPLANE_URL, GATEKEEPER_SVC_TOKEN,
+                                         POLICY_POLL_INTERVAL)
+        registry = None  # no file registry in control-plane mode
+    else:
+        key_resolver = TenantRegistry(TENANTS_PATH)
+        key_resolver.ensure("default")  # requests without X-Tenant-Id land here
+        registry = key_resolver  # v1 alias (tests, demo tooling)
+        policy_cache = None
+    log = ReceiptLog(RECEIPT_PATH, key_resolver)
     # Receipt emitter: POSTs per-tenant receipts to the receipt service;
     # any ingest failure falls back to the local ReceiptLog file above.
-    emitter = ReceiptEmitter(registry, log)
+    emitter = ReceiptEmitter(key_resolver, log)
 
     sessions = {}  # Mcp-Session-Id -> tenant_id
     sessions_lock = threading.Lock()
@@ -154,7 +182,7 @@ class Handler(BaseHTTPRequestHandler):
         sid = self.headers.get("Mcp-Session-Id")
         if tid:
             try:
-                self.registry.signing_key(tid)
+                self.key_resolver.signing_key(tid)
             except KeyError:
                 return None, (403, {"error": f"unknown tenant '{tid}'"})
             if sid:
@@ -167,6 +195,39 @@ class Handler(BaseHTTPRequestHandler):
             if bound:
                 return bound, None
         return "default", None
+
+    def _is_suspended(self, tenant_id):
+        """True when the control plane marks the tenant non-active.
+
+        Fail closed: if the key authority can't answer, the tenant is
+        treated as suspended.
+        """
+        if not CP_ACTIVE:
+            return False
+        try:
+            return self.key_resolver.status(tenant_id) != "active"
+        except KeyError:
+            return True
+
+    def _policy_for(self, tenant_id):
+        """Compiled policy for this tenant.
+
+        Control-plane bundle when active and available (refreshed
+        opportunistically on bundle-version drift, plus the background
+        poller); the file policy otherwise. Enforcement never blocks on a
+        fresh fetch.
+        """
+        if CP_ACTIVE:
+            try:
+                kb_version = self.key_resolver.policy_version(tenant_id)
+            except KeyError:
+                kb_version = 0
+            if kb_version > self.policy_cache.bundle_version(tenant_id):
+                self.policy_cache.refresh_tenant(tenant_id)
+            cached = self.policy_cache.policy_for(tenant_id)
+            if cached is not None:
+                return cached
+        return self.policy
 
     def _bind_session(self, session_id, tenant_id):
         if session_id:
@@ -249,6 +310,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- HTTP verbs ----------
     def do_POST(self):
+        if self.path == "/internal/cache/invalidate":
+            return self._handle_invalidate()
         if self.path != "/mcp":
             return self._send(404, {"error": "not found"})
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -294,17 +357,69 @@ class Handler(BaseHTTPRequestHandler):
         if method == "tools/call":
             return self._handle_tools_call(req, req_id, tenant_id, agent_id, task_id)
 
+        if CP_ACTIVE and self._is_suspended(tenant_id):
+            return self._send(403, {"error": "tenant suspended"})
+
         # Discovery / capability calls pass through untouched.
         up = self._upstream_request("POST", json.dumps(req).encode("utf-8"))
         session_id, _ = self._relay_response(up)
         self._bind_session(session_id, tenant_id)
 
+    def _handle_invalidate(self):
+        """POST /internal/cache/invalidate — drop a cached key bundle (§4.3).
+
+        Called best-effort by the control plane on rotate/suspend/plan-change;
+        the 60s TTL is the backstop, so this endpoint only hurries it up.
+        """
+        if not CP_ACTIVE:
+            return self._send(404, {"error": "not found"})
+        if (not GATEKEEPER_SVC_TOKEN or self.headers.get("Authorization", "")
+                != f"Bearer {GATEKEEPER_SVC_TOKEN}"):
+            return self._send(401, {"error": "unauthorized"})
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            body = json.loads(self.rfile.read(length)) if length else {}
+        except json.JSONDecodeError:
+            return self._send(400, {"error": "invalid json"})
+        tenant_id = body.get("tenant_id", "")
+        if not tenant_id:
+            return self._send(400, {"error": "tenant_id required"})
+        self.key_resolver.invalidate(tenant_id)
+        self.policy_cache.invalidate(tenant_id)
+        return self._send(200, {"ok": True, "tenant_id": tenant_id})
+
     def _handle_tools_call(self, req, req_id, tenant_id, agent_id, task_id):
         tool = (req.get("params") or {}).get("name", "")
         args = (req.get("params") or {}).get("arguments", {})
 
-        allowed, reason, rule_id = self.policy.decide(task_id, tool, args)
-        policy_version = self.policy.version_for(task_id)
+        if CP_ACTIVE and self._is_suspended(tenant_id):
+            # Deny-all for suspended tenants (§4.3): still receipted, so the
+            # audit trail shows the blocked attempt.
+            receipt = self.emitter.emit(
+                tenant_id=tenant_id,
+                task_id=task_id or "unknown",
+                agent_id=agent_id,
+                tool=tool,
+                args=args,
+                decision="deny",
+                reason="tenant suspended",
+                rule_id=None,
+                policy_version=self.key_resolver.policy_version(tenant_id),
+            )
+            print(
+                f"[DENY] tenant={tenant_id} task={task_id} agent={agent_id} "
+                f"tool={tool} rule=None receipt={receipt['seq']} (suspended)"
+            )
+            return self._send_rpc(
+                self._rpc_error(
+                    req_id, -32000,
+                    f"policy denied: tenant suspended (receipt #{receipt['seq']})"
+                )
+            )
+
+        policy = self._policy_for(tenant_id)
+        allowed, reason, rule_id = policy.decide(task_id, tool, args)
+        policy_version = policy.version_for(task_id)
 
         if not allowed:
             receipt = self.emitter.emit(
@@ -356,6 +471,8 @@ class Handler(BaseHTTPRequestHandler):
         if err:
             code, obj = err
             return self._send(code, obj)
+        if CP_ACTIVE and self._is_suspended(tenant_id):
+            return self._send(403, {"error": "tenant suspended"})
         if not self.headers.get("Mcp-Session-Id"):
             return self._send(400, {"error": "Mcp-Session-Id required"})
         up = self._upstream_request("GET")
@@ -369,6 +486,12 @@ class Handler(BaseHTTPRequestHandler):
         # Session termination: relay upstream, forget the binding.
         if self.path != "/mcp":
             return self._send(404, {"error": "not found"})
+        tenant_id, err = self._resolve_tenant()
+        if err:
+            code, obj = err
+            return self._send(code, obj)
+        if CP_ACTIVE and self._is_suspended(tenant_id):
+            return self._send(403, {"error": "tenant suspended"})
         session_id = self.headers.get("Mcp-Session-Id")
         up = self._upstream_request("DELETE")
         if isinstance(up, tuple):

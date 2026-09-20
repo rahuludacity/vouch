@@ -8,16 +8,18 @@ Endpoints (§4.2, §4.6):
     POST /v1/ingest                  service token
       201 {"tenant_id","seq","hash"} | 409 {"error":"duplicate_seq"}
       | 422 {"error":"chain_break","expected_prev_hash",...}
-    GET  /v1/receipts?tenant_id=&task_id=&tool=&decision=&agent_id=
-         &limit=&cursor=&order=      service token
-    GET  /v1/receipts/<seq>?tenant_id=  service token
-    GET  /v1/receipts/stream?tenant_id=&task_id=   SSE, service token
-    GET  /v1/verify?tenant_id=       service token
-    GET  /internal/usage/<tenant_id>?month=YYYY-MM  service token
+    GET  /v1/receipts?task_id=&tool=&decision=&agent_id=&limit=&cursor=&order=
+         service token (tenant_id required) or tenant API key (scoped to its
+         tenant; ?tenant_id= optional, must match)
+    GET  /v1/receipts/<seq>          service token or tenant API key (same scoping)
+    GET  /v1/receipts/stream?task_id=   SSE, service token or tenant API key
+    GET  /v1/verify                  service token or tenant API key (§4.6:
+                                     "public-with-key"; keys stay server-side)
+    GET  /internal/usage/<tenant_id>?month=YYYY-MM  service token (CP fan-in)
     GET  /v1/health                  no auth (gatekeeper circuit-breaker)
 
-Auth, Phase 1: one service-token bearer for every endpoint except /v1/health.
-Tenant API keys (vouch_sk_*) arrive with the control plane in Phase 2.
+Tenant API keys (vouch_sk_*) are validated against the control plane's
+GET /v1/tenants/me (introspection, 60s cache) — no key material here.
 
 Signature verification runs server-side against tenants.json (§4.7 moves
 this to the control plane in Phase 2). Key material never leaves the server.
@@ -27,17 +29,26 @@ Env:  RECEIPT_PORT        (default 9001)
       RECEIPT_DB          sqlite path (default <repo>/receipts.db)
       RECEIPT_SVC_TOKEN   bearer token (default "dev-token"; set in prod)
       TENANTS_PATH        tenant registry (default <repo>/tenants.json)
+      CONTROLPLANE_URL    control plane base (default ""; when set, verify
+                          fetches tenant keys from the control plane per §4.7,
+                          with tenants.json as fallback)
+      CONTROLPLANE_SVC_TOKEN  bearer the receipt service presents to the
+                          control plane (default "")
 """
 import json
 import os
+import hashlib
 import queue
 import threading
 import time
+import urllib.request
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from .store import ReceiptStore, ChainBreak, DuplicateSeq
-from .keys import load_verification_keys
+from . import keys as keys_module
+from .keys import load_verification_keys, KeyAuthorityUnavailable
 
 HERE = os.path.dirname(__file__)
 PORT = int(os.environ.get("RECEIPT_PORT", "9001"))
@@ -46,6 +57,10 @@ DB_PATH = os.environ.get(
 SVC_TOKEN = os.environ.get("RECEIPT_SVC_TOKEN", "dev-token")
 TENANTS_PATH = os.environ.get(
     "TENANTS_PATH", os.path.join(HERE, "..", "..", "tenants.json"))
+# Phase 2: when set, tenant keys come from the control plane (§4.7) with the
+# tenants.json file as fallback. The service presents CP_SVC_TOKEN there.
+CONTROLPLANE_URL = os.environ.get("CONTROLPLANE_URL", "").rstrip("/")
+CP_SVC_TOKEN = os.environ.get("CONTROLPLANE_SVC_TOKEN", "")
 
 REQUIRED_FIELDS = (
     "tenant_id", "seq", "ts", "kid", "task_id", "agent_id", "tool",
@@ -57,6 +72,12 @@ class Handler(BaseHTTPRequestHandler):
     store = None          # ReceiptStore, set in main()
     tenants_path = None
     svc_token = None
+    controlplane_url = None
+    cp_token = None
+    # tenant API-key introspection cache: sha256(key) -> (tenant_id, expires)
+    _tenant_key_cache = {}
+    _tenant_key_lock = threading.Lock()
+    _TENANT_KEY_TTL = 60.0
     subscribers = {}      # tenant_id -> [queue.Queue, ...]
     subs_lock = threading.Lock()
 
@@ -86,6 +107,67 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    # --------------------------------------- tenant API-key auth (§4.6)
+    def _auth_context(self):
+        """Who is calling: ("service", None) | ("tenant", tenant_id) | None.
+
+        Service tokens keep full access (gatekeeper ingest, ops). Tenant
+        `vouch_sk_*` keys are validated against the control plane's
+        GET /v1/tenants/me (token introspection — no new endpoint needed),
+        cached 60s; failures fail closed and are never cached.
+        """
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return None
+        token = auth[7:]
+        if self.svc_token and token == self.svc_token:
+            return ("service", None)
+        if token.startswith("vouch_sk_") and self.controlplane_url:
+            tid = self._introspect_tenant_key(token)
+            if tid:
+                return ("tenant", tid)
+        return None
+
+    @classmethod
+    def _introspect_tenant_key(cls, token):
+        """tenant_id for a vouch_sk_* key, or None. Never raises."""
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        now = time.time()
+        with cls._tenant_key_lock:
+            hit = cls._tenant_key_cache.get(digest)
+            if hit and hit[1] > now:
+                return hit[0]
+        url = cls.controlplane_url.rstrip("/") + "/v1/tenants/me"
+        req = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status != 200:
+                    return None
+                tid = json.loads(resp.read().decode("utf-8")).get("tenant_id")
+        except Exception:  # noqa: BLE001 - fail closed, don't cache
+            return None
+        if not tid:
+            return None
+        with cls._tenant_key_lock:
+            cls._tenant_key_cache[digest] = (tid, now + cls._TENANT_KEY_TTL)
+        return tid
+
+    def _scoped_tenant(self, q, auth):
+        """Effective tenant_id for a tenant-API read.
+
+        Service callers pass ?tenant_id= (required, as before). Tenant-key
+        callers are scoped to their own tenant: an explicit ?tenant_id=
+        must match it (§4.6: the key IS the tenant).
+        """
+        kind, tid = auth
+        if kind == "service":
+            return q.get("tenant_id")
+        requested = q.get("tenant_id")
+        if requested and requested != tid:
+            return "FORBIDDEN"
+        return tid
+
     def _path(self):
         u = urlparse(self.path)
         return u.path, {k: v[0] for k, v in parse_qs(u.query).items()}
@@ -107,22 +189,30 @@ class Handler(BaseHTTPRequestHandler):
         path, q = self._path()
         if path == "/v1/health":
             return self._send(200, {"ok": True})
-        if not self._require_auth():
-            return
-        if path == "/v1/receipts":
-            return self._get_receipts(q)
-        if path == "/v1/receipts/stream":
-            return self._stream(q)
-        if path.startswith("/v1/receipts/"):
-            return self._get_receipt_one(path, q)
-        if path == "/v1/verify":
-            return self._verify(q)
         if path.startswith("/internal/usage/"):
+            # control-plane usage fan-in (§4.8): service token only.
+            if not self._require_auth():
+                return
             return self._usage(path, q)
+        auth = self._auth_context()
+        if auth is None:
+            return self._err(401, "unauthorized",
+                             "service token or vouch_sk_* API key required")
+        if path == "/v1/receipts":
+            return self._get_receipts(q, auth)
+        if path == "/v1/receipts/stream":
+            return self._stream(q, auth)
+        if path.startswith("/v1/receipts/"):
+            return self._get_receipt_one(path, q, auth)
+        if path == "/v1/verify":
+            return self._verify(q, auth)
         return self._err(404, "not_found")
 
-    def _get_receipts(self, q):
-        tenant_id = q.get("tenant_id")
+    def _get_receipts(self, q, auth):
+        tenant_id = self._scoped_tenant(q, auth)
+        if tenant_id == "FORBIDDEN":
+            return self._err(403, "forbidden",
+                             "tenant_id does not match the API key")
         if not tenant_id:
             return self._err(400, "bad_request", "tenant_id is required")
         try:
@@ -137,9 +227,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(400, "bad_request", str(e))
         return self._send(200, {"items": items, "next_cursor": next_cursor})
 
-    def _get_receipt_one(self, path, q):
-        tenant_id = q.get("tenant_id")
+    def _get_receipt_one(self, path, q, auth):
+        tenant_id = self._scoped_tenant(q, auth)
         seq = path[len("/v1/receipts/"):]
+        if tenant_id == "FORBIDDEN":
+            return self._err(403, "forbidden",
+                             "tenant_id does not match the API key")
         if not tenant_id or not seq.isdigit():
             return self._err(400, "bad_request",
                              "tenant_id and numeric seq are required")
@@ -148,15 +241,36 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(404, "not_found")
         return self._send(200, row)
 
-    def _verify(self, q):
-        tenant_id = q.get("tenant_id")
+    def _verify(self, q, auth):
+        tenant_id = self._scoped_tenant(q, auth)
+        if tenant_id == "FORBIDDEN":
+            return self._err(403, "forbidden",
+                             "tenant_id does not match the API key")
         if not tenant_id:
             return self._err(400, "bad_request", "tenant_id is required")
         try:
-            keys = load_verification_keys(self.tenants_path, tenant_id)
+            keys = load_verification_keys(self.tenants_path, tenant_id,
+                                          self.controlplane_url, self.cp_token)
+        except KeyAuthorityUnavailable as e:
+            return self._err(503, "key_authority_unavailable", str(e))
         except (KeyError, FileNotFoundError, ValueError) as e:
             return self._err(404, "unknown_tenant", str(e))
         ok, failures = self.store.verify_tenant(tenant_id, keys)
+        if (not ok and self.controlplane_url and any(
+                f.get("error", "").startswith("unknown key id")
+                for f in failures)):
+            # Rotation race: the 5-minute key cache predates a key rotation.
+            # Refresh once and re-verify instead of failing the chain.
+            keys_module.invalidate_cache(tenant_id)
+            try:
+                keys = load_verification_keys(self.tenants_path, tenant_id,
+                                              self.controlplane_url,
+                                              self.cp_token)
+            except (KeyAuthorityUnavailable, KeyError, FileNotFoundError,
+                    ValueError):
+                pass  # keep the original (more informative) failures
+            else:
+                ok, failures = self.store.verify_tenant(tenant_id, keys)
         return self._send(200, {
             "tenant_id": tenant_id,
             "receipts": self.store.count(tenant_id),
@@ -171,8 +285,11 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, self.store.get_usage(tenant_id, q.get("month")))
 
     # ---------------------------------------------------------------- SSE
-    def _stream(self, q):
-        tenant_id = q.get("tenant_id")
+    def _stream(self, q, auth):
+        tenant_id = self._scoped_tenant(q, auth)
+        if tenant_id == "FORBIDDEN":
+            return self._err(403, "forbidden",
+                             "tenant_id does not match the API key")
         if not tenant_id:
             return self._err(400, "bad_request", "tenant_id is required")
         task_id = q.get("task_id")
@@ -289,9 +406,15 @@ def main():
     Handler.store = ReceiptStore(DB_PATH)
     Handler.tenants_path = TENANTS_PATH
     Handler.svc_token = SVC_TOKEN
+    Handler.controlplane_url = CONTROLPLANE_URL
+    Handler.cp_token = CP_SVC_TOKEN
     print(f"vouch receipt service listening on :{PORT}")
     print(f"db:      {DB_PATH}")
     print(f"tenants: {TENANTS_PATH}")
+    if CONTROLPLANE_URL:
+        print(f"key authority: control plane at {CONTROLPLANE_URL} (file fallback)")
+    else:
+        print("key authority: tenants.json file")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 
