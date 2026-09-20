@@ -135,6 +135,30 @@ def sign_webhook(payload_bytes, secret=WEBHOOK_SECRET, ts=None):
     return f"t={ts},v1={mac}"
 
 
+def _raw_oversized_status(base_url, path, headers=None):
+    """Declare ``Content-Length: 1000001`` but send only a partial body;
+    return the response status. urllib's full-body send races the server's
+    early 413 and flakes with BrokenPipeError; the raw socket proves the
+    server decides on the headers alone, before touching the body."""
+    u = urllib.parse.urlparse(base_url)
+    s = socket.create_connection((u.hostname, u.port or 80), timeout=15)
+    try:
+        lines = ["POST %s HTTP/1.1" % path, "Host: %s" % u.hostname,
+                 "Content-Length: 1000001", "Connection: close"]
+        for k, v in (headers or {}).items():
+            lines.append("%s: %s" % (k, v))
+        s.sendall(("\r\n".join(lines) + "\r\n\r\n").encode() + b"x" * 1024)
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        return int(resp.split(b" ", 2)[1])
+    finally:
+        s.close()
+
+
 class BillingTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -362,10 +386,10 @@ class BillingTest(unittest.TestCase):
 
     def test_08b_webhook_oversized_body_rejected(self):
         # >1MB bodies are refused before any signature work (413, not 401).
-        big = b"x" * (1_000_001)
-        s, _ = http("POST", self.bill + "/v1/stripe/webhook", big,
-                    {"Content-Type": "application/json",
-                     "Stripe-Signature": "t=1,v1=nope"})
+        s = _raw_oversized_status(
+            self.bill, "/v1/stripe/webhook",
+            {"Content-Type": "application/json",
+             "Stripe-Signature": "t=1,v1=nope"})
         self.assertEqual(s, 413)
 
     def test_09_subscription_deleted_downgrades_to_free(self):

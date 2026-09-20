@@ -23,19 +23,25 @@ class MCPClient:
 
         mcp = MCPClient("http://127.0.0.1:9000/mcp",
                         tenant_id="acme", task_id="deploy-staging",
-                        agent_id="agent-001")
+                        agent_id="agent-001",
+                        deployment_token=os.environ["VOUCH_DEPLOYMENT_TOKEN"])
         mcp.initialize()
         result = mcp.call_tool("run_tests", {"suite": "unit"})
         mcp.close()
+
+    ``deployment_token`` is the per-deployment gatekeeper credential (H-1):
+    the runner injects it into the agent container as VOUCH_DEPLOYMENT_TOKEN
+    and the gatekeeper validates it before honoring the identity headers.
     """
 
     def __init__(self, gatekeeper_url, tenant_id, task_id, agent_id,
-                 timeout=30):
+                 timeout=30, deployment_token=None):
         self.gatekeeper_url = gatekeeper_url.rstrip("/")
         self.tenant_id = tenant_id
         self.task_id = task_id
         self.agent_id = agent_id
         self.timeout = timeout
+        self.deployment_token = deployment_token
         self.session_id = None
         self._ids = itertools.count(1)
 
@@ -48,6 +54,8 @@ class MCPClient:
             "X-Agent-Id": self.agent_id,
             "X-Task-Id": self.task_id,
         }
+        if self.deployment_token:
+            h["X-Deployment-Token"] = self.deployment_token
         if self.session_id:
             h["Mcp-Session-Id"] = self.session_id
         return h

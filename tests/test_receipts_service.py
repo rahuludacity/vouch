@@ -11,6 +11,8 @@ import tempfile
 import threading
 import time
 import unittest
+import socket
+import urllib.parse
 import urllib.request
 import urllib.error
 from http.server import ThreadingHTTPServer
@@ -50,6 +52,32 @@ def make_receipt(tenant_id, seq, prev_hash, **kw):
                          decision=r["decision"], reason=r["reason"],
                          rule_id=r["rule_id"],
                          policy_version=r["policy_version"])
+
+
+
+
+def _raw_oversized_status(base_url, path, headers=None):
+    """Declare ``Content-Length: 1000001`` but send only a partial body;
+    return the response status. urllib's full-body send races the server's
+    early 413 and flakes with BrokenPipeError; the raw socket proves the
+    server decides on the headers alone, before touching the body."""
+    u = urllib.parse.urlparse(base_url)
+    s = socket.create_connection((u.hostname, u.port or 80), timeout=15)
+    try:
+        lines = ["POST %s HTTP/1.1" % path, "Host: %s" % u.hostname,
+                 "Content-Length: 1000001", "Connection: close"]
+        for k, v in (headers or {}).items():
+            lines.append("%s: %s" % (k, v))
+        s.sendall(("\r\n".join(lines) + "\r\n\r\n").encode() + b"x" * 1024)
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        return int(resp.split(b" ", 2)[1])
+    finally:
+        s.close()
 
 
 class ServiceTest(unittest.TestCase):
@@ -108,6 +136,14 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(resp["error"], "unauthorized")
         code, _ = self.request("POST", "/v1/ingest", {}, token=None)
         self.assertEqual(code, 401)
+
+    def test_ingest_oversized_body_rejected(self):
+        # M-2: >1MB bodies are refused before any signature/hash work.
+        code = _raw_oversized_status(
+            self.base, "/v1/ingest",
+            {"Authorization": f"Bearer {TOKEN}",
+             "Content-Type": "application/json"})
+        self.assertEqual(code, 413)
 
     def test_ingest_201_409_422(self):
         r1 = self.ingest_next(tool="run_tests")

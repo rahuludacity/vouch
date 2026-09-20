@@ -8,10 +8,14 @@
 export class MCPError extends Error {}
 
 export class MCPClient {
-  constructor(gatekeeperUrl, { tenantId, taskId, agentId, timeoutMs = 30000 } = {}) {
+  constructor(gatekeeperUrl, { tenantId, taskId, agentId, timeoutMs = 30000,
+                               deploymentToken = null } = {}) {
     this.url = gatekeeperUrl.replace(/\/$/, "");
     this.tenantId = tenantId; this.taskId = taskId; this.agentId = agentId;
     this.timeoutMs = timeoutMs;
+    // H-1: per-deployment gatekeeper credential, injected by the runner as
+    // VOUCH_DEPLOYMENT_TOKEN. Sent as X-Deployment-Token on every request.
+    this.deploymentToken = deploymentToken;
     this.sessionId = null;
     this._nextId = 1;
   }
@@ -22,6 +26,7 @@ export class MCPClient {
       "X-Tenant-Id": this.tenantId, "X-Agent-Id": this.agentId,
       "X-Task-Id": this.taskId,
     };
+    if (this.deploymentToken) h["X-Deployment-Token"] = this.deploymentToken;
     if (this.sessionId) h["Mcp-Session-Id"] = this.sessionId;
     return h;
   }

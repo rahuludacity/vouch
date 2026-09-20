@@ -69,6 +69,36 @@ def http(method, url, body=None, headers=None, timeout=10):
             return e.code, raw
 
 
+def _mint_receipt(tenant_id, kid, key_hex, seq, prev_hash, tool, decision,
+                task_id="h2-task", agent_id="agent-1"):
+    """A receipt signed exactly like gatekeeper/receipts.py signs them."""
+    import hashlib, hmac as hmac_mod, time
+    key = bytes.fromhex(key_hex)
+    body = {
+        "seq": seq,
+        "ts": round(time.time(), 3),
+        "tenant_id": tenant_id,
+        "kid": kid,
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "tool": tool,
+        "args_sha256": hashlib.sha256(
+            json.dumps({}, sort_keys=True, default=str).encode()).hexdigest(),
+        "decision": decision,
+        "reason": None,
+        "rule_id": None,
+        "policy_version": 1,
+        "prev_hash": prev_hash,
+    }
+    body["hash"] = hashlib.sha256(
+        prev_hash.encode() + json.dumps(body, sort_keys=True).encode()
+    ).hexdigest()
+    body["sig"] = hmac_mod.new(
+        key, json.dumps(body, sort_keys=True).encode(),
+        hashlib.sha256).hexdigest()
+    return body
+
+
 def wait_up(check, timeout=20):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -112,12 +142,16 @@ class TestControlPlaneModels(unittest.TestCase):
         keys = self.db.get_keys(tid)
         self.assertEqual(keys["current_kid"], "k3")
         self.assertEqual(sorted(keys["keys"]), ["k1", "k2", "k3"])
-        # cap: current + 3 retired -> 4th rotate prunes k1
+        # H-2: NO cap — all retired keys are retained indefinitely, so
+        # receipts signed under any old kid verify forever. The 4th and 5th
+        # rotations must NOT prune k1/k2 (old receipts must keep verifying).
         self.assertEqual(self.db.rotate_keys(tid), "k4")
         self.assertEqual(self.db.rotate_keys(tid), "k5")
+        self.assertEqual(self.db.rotate_keys(tid), "k6")
         keys = self.db.get_keys(tid)
-        self.assertEqual(keys["current_kid"], "k5")
-        self.assertEqual(sorted(keys["keys"]), ["k2", "k3", "k4", "k5"])
+        self.assertEqual(keys["current_kid"], "k6")
+        self.assertEqual(sorted(keys["keys"]),
+                         ["k1", "k2", "k3", "k4", "k5", "k6"])
         self.assertIsNone(self.db.rotate_keys("ghost"))
 
     def test_key_bundle_shape(self):
@@ -194,9 +228,22 @@ class TestControlPlaneModels(unittest.TestCase):
         tok1 = self.db.seed_service_token("gatekeeper")
         self.assertTrue(tok1.startswith("vouch_svc_"))
         self.assertIsNone(self.db.seed_service_token("gatekeeper"))
-        self.assertEqual(self.db.validate_service_token(tok1), "gatekeeper")
-        self.assertIsNone(self.db.validate_service_token("garbage"))
-        self.assertIsNone(self.db.validate_service_token(""))
+        # Legacy "internal" scope reads as all scopes (existing DBs).
+        name, scopes = self.db.validate_service_token(tok1)
+        self.assertEqual(name, "gatekeeper")
+        self.assertIn("tenant:admin", scopes)
+        # M-1: explicit least-privilege scopes are honored exactly.
+        t2 = self.db.seed_service_token(
+            "runner", "deployments:read,deployments:status,cache:invalidate")
+        name2, scopes2 = self.db.validate_service_token(t2)
+        self.assertEqual(name2, "runner")
+        self.assertIn("deployments:read", scopes2)
+        self.assertNotIn("keys:read", scopes2)
+        self.assertNotIn("tenant:admin", scopes2)
+        self.assertEqual(self.db.validate_service_token("garbage"),
+                         (None, frozenset()))
+        self.assertEqual(self.db.validate_service_token(""),
+                         (None, frozenset()))
 
     def test_api_key_crud(self):
         t = self.db.create_tenant("Acme")
@@ -471,6 +518,32 @@ class UpstreamStub(BaseHTTPRequestHandler):
         pass
 
 
+
+
+def _raw_oversized_status(base_url, path, headers=None):
+    """Declare ``Content-Length: 1000001`` but send only a partial body;
+    return the response status. urllib's full-body send races the server's
+    early 413 and flakes with BrokenPipeError; the raw socket proves the
+    server decides on the headers alone, before touching the body."""
+    u = urllib.parse.urlparse(base_url)
+    s = socket.create_connection((u.hostname, u.port or 80), timeout=15)
+    try:
+        lines = ["POST %s HTTP/1.1" % path, "Host: %s" % u.hostname,
+                 "Content-Length: 1000001", "Connection: close"]
+        for k, v in (headers or {}).items():
+            lines.append("%s: %s" % (k, v))
+        s.sendall(("\r\n".join(lines) + "\r\n\r\n").encode() + b"x" * 1024)
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        return int(resp.split(b" ", 2)[1])
+    finally:
+        s.close()
+
+
 class TestControlPlaneE2E(unittest.TestCase):
     """The Phase 2 exit gate, against real subprocesses."""
 
@@ -503,6 +576,7 @@ class TestControlPlaneE2E(unittest.TestCase):
         cls.svc_token = toks["RECEIPT_SVC_TOKEN"]
         cls.gk_token = toks["GATEKEEPER_SVC_TOKEN"]
         cls.runner_token = toks["RUNNER_TOKEN"]
+        cls.billing_token = toks["BILLING_SVC_TOKEN"]
 
         ok = wait_up(lambda: http(
             "GET", cls.cp_url + "/internal/desired-state",
@@ -582,6 +656,18 @@ class TestControlPlaneE2E(unittest.TestCase):
         assert code == 201, created
         cls.tid = created["tenant_id"]
         cls.api_key = created["api_key"]
+        # ---- provision a deployment and its gatekeeper credential (H-1):
+        # the runner injects this into the agent container at reconcile time;
+        # every /mcp call must present it as X-Deployment-Token.
+        code, dep = http(
+            "POST", cls.cp_url + "/v1/deployments",
+            {"task_id": "deploy-staging",
+             "agent_image": "vouch/agent-demo:latest"},
+            headers={"Authorization": f"Bearer {cls.api_key}"})
+        assert code == 201, dep
+        cls.dep_id = dep["deployment_id"]
+        cls.dep_token = dep["deployment_token"]
+        assert cls.dep_token, "deployment creation must mint a credential"
 
     @classmethod
     def tearDownClass(cls):
@@ -602,8 +688,19 @@ class TestControlPlaneE2E(unittest.TestCase):
     def _svc(self):
         return {"Authorization": f"Bearer {self.svc_token}"}
 
+    def _runner_svc(self):
+        # deployments:status scope: the runner's status callback must not be
+        # callable with the receipt-service token (M-1).
+        return {"Authorization": f"Bearer {self.runner_token}"}
+
+    def _billing_svc(self):
+        # tenant:admin scope: suspension/plan changes go through the billing
+        # token, not the receipt-service token (M-1).
+        return {"Authorization": f"Bearer {self.billing_token}"}
+
     def _tenant_headers(self, task_id):
-        return {"X-Tenant-Id": self.tid, "X-Task-Id": task_id}
+        return {"X-Tenant-Id": self.tid, "X-Task-Id": task_id,
+                "X-Deployment-Token": self.dep_token}
 
     def _invalidate(self):
         """Direct gatekeeper cache drop (deterministic; the CP also pushes)."""
@@ -672,6 +769,59 @@ class TestControlPlaneE2E(unittest.TestCase):
                             headers=self._auth())
         self.assertEqual(code, 200)
         self.assertEqual(listed["tasks"], {})
+
+    def test_03b_deployment_credential_is_enforced(self):
+        # H-1: the gatekeeper trusts nothing self-asserted. A second
+        # deployment is created, exercised, then stopped — its credential
+        # must fail immediately after revocation.
+        self._put_policy({
+            "allow": [{"rule_id": "read-ok", "tool": "read_file",
+                       "args": {"path": {"prefix": "/data/"}}}],
+            "deny": []})
+        self._invalidate()
+        code, dep2 = http(
+            "POST", self.cp_url + "/v1/deployments",
+            {"task_id": "deploy-staging",
+             "agent_image": "vouch/agent-demo:latest"},
+            headers=self._auth())
+        self.assertEqual(code, 201, dep2)
+        dep2_id, tok2 = dep2["deployment_id"], dep2["deployment_token"]
+
+        def call_with(tenant_id, token):
+            h = {"X-Tenant-Id": tenant_id, "X-Task-Id": "deploy-staging"}
+            if token:
+                h["X-Deployment-Token"] = token
+            return http("POST", self.gk_url + "/mcp",
+                        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": "read_file",
+                                   "arguments": {"path": "/data/x.csv"}}},
+                        headers=h)
+
+        # valid token works
+        code, _ = call_with(self.tid, tok2)
+        self.assertEqual(code, 200)
+        # missing -> 403
+        code, body = call_with(self.tid, None)
+        self.assertEqual(code, 403, body)
+        self.assertEqual(body["error"], "deployment_credential_required")
+        # malformed -> 403
+        code, body = call_with(self.tid, "not-a-token")
+        self.assertEqual(code, 403, body)
+        # forged MAC -> 403
+        code, body = call_with(self.tid, tok2[:-2] + ("00" if tok2[-2:] != "00" else "11"))
+        self.assertEqual(code, 403, body)
+        # X-Tenant-Id mismatched against the token's tenant -> 403
+        code, body = call_with("some-other-tenant", tok2)
+        self.assertEqual(code, 403, body)
+        self.assertEqual(body["error"], "tenant_mismatch")
+        # stop the deployment -> credential revoked -> 403 immediately
+        code, _ = http("DELETE", self.cp_url + f"/v1/deployments/{dep2_id}",
+                       headers=self._auth())
+        self.assertEqual(code, 200, (code, dep2_id))
+        self._invalidate()
+        code, body = call_with(self.tid, tok2)
+        self.assertEqual(code, 403, body)
+        self.assertEqual(body["error"], "invalid_deployment_credential")
 
     def test_03_gated_calls_allow_and_deny(self):
         self._put_policy({
@@ -749,9 +899,16 @@ class TestControlPlaneE2E(unittest.TestCase):
         self.assertTrue(v["chain_ok"], v)
 
     def test_06_suspend_denies_everything(self):
+        # M-1: suspension is a tenant:admin action — the receipt-service
+        # token is correctly rejected here...
         code, body = http("POST",
                           self.cp_url + f"/internal/tenants/{self.tid}/status",
                           {"status": "suspended"}, headers=self._svc())
+        self.assertEqual(code, 403, body)
+        # ...so the billing-scoped token does it.
+        code, body = http("POST",
+                          self.cp_url + f"/internal/tenants/{self.tid}/status",
+                          {"status": "suspended"}, headers=self._billing_svc())
         self.assertEqual(code, 200, body)
         # the control plane pushed the invalidate; no manual drop needed
         code, resp = self._call("deploy-staging", "read_file",
@@ -772,7 +929,7 @@ class TestControlPlaneE2E(unittest.TestCase):
         # reactivate: the tenant works again
         code, _ = http("POST",
                        self.cp_url + f"/internal/tenants/{self.tid}/status",
-                       {"status": "active"}, headers=self._svc())
+                       {"status": "active"}, headers=self._billing_svc())
         self.assertEqual(code, 200)
         code, resp = self._call("deploy-staging", "read_file",
                                 {"path": "/data/back.csv"}, req_id=6)
@@ -811,23 +968,25 @@ class TestControlPlaneE2E(unittest.TestCase):
         code, deps = http("GET", self.cp_url + "/v1/deployments",
                           headers=self._auth())
         self.assertEqual(code, 200)
-        self.assertEqual(len(deps["deployments"]), 1)
+        # test_03b created and stopped a second deployment earlier, so the
+        # list is not a singleton — assert the new one is present.
+        self.assertIn(dep_id, [d["id"] for d in deps["deployments"]])
         code, one = http("GET", self.cp_url + f"/v1/deployments/{dep_id}",
                          headers=self._auth())
         self.assertEqual(code, 200)
         # runner view of desired state (§4.5): pending -> desired running
         code, desired = http("GET", self.cp_url + "/internal/desired-state",
-                             headers=self._svc())
+                             headers=self._runner_svc())
         self.assertEqual(code, 200)
         self.assertEqual(desired["deployments"][0]["desired"], "running")
         # runner reports running
         code, _ = http("POST",
                        self.cp_url + f"/internal/deployments/{dep_id}/status",
                        {"status": "running", "container_id": "c1"},
-                       headers=self._svc())
+                       headers=self._runner_svc())
         self.assertEqual(code, 200)
         code, desired = http("GET", self.cp_url + "/internal/desired-state",
-                             headers=self._svc())
+                             headers=self._runner_svc())
         self.assertEqual(desired["deployments"][0]["desired"], "running")
         # usage fanned in from the receipt service via /v1/tenants/me
         code, me = http("GET", self.cp_url + "/v1/tenants/me",
@@ -841,6 +1000,117 @@ class TestControlPlaneE2E(unittest.TestCase):
                              headers=self._auth())
         self.assertEqual(code, 200)
         self.assertEqual(stopped["status"], "stopped")
+
+    def test_08a_oldest_key_still_verifies_after_five_rotations(self):
+        # H-2: key history is retained indefinitely — a receipt signed by
+        # the oldest key still verifies after five more rotations.
+        # (Kid names are relative: earlier tests may already have rotated.)
+        import sqlite3
+
+        def kids():
+            code, bundle = http(
+                "GET", self.cp_url + f"/internal/tenants/{self.tid}/key-bundle",
+                headers=self._svc())
+            self.assertEqual(code, 200)
+            return bundle
+
+        before = kids()
+        oldest_kid = sorted(before["keys"].keys(),
+                            key=lambda k: int(k[1:]))[0]
+        n_before = len(before["keys"])
+        con = sqlite3.connect(self.cp_db)
+        key_hex = con.execute(
+            "SELECT key_hex FROM tenant_keys WHERE tenant_id=? AND kid=?",
+            (self.tid, oldest_kid)).fetchone()[0]
+        con.close()
+
+        for _ in range(5):
+            code, body = http("POST", self.cp_url + "/v1/tenants/me/rotate-keys",
+                              headers=self._auth())
+            self.assertEqual(code, 200, body)
+
+        # the full history is retained: all old kids plus the five new ones
+        after = kids()
+        self.assertEqual(len(after["keys"]), n_before + 5)
+        for k in before["keys"]:
+            self.assertIn(k, after["keys"])
+        self.assertEqual(after["keys"][oldest_kid], before["keys"][oldest_kid])
+
+        # mint a receipt with the OLDEST key and ingest it now
+        # (/v1/receipts defaults to order=desc: items[0] is the tip)
+        items = self._receipts(self._svc(), f"?tenant_id={self.tid}")
+        seq = max([r["seq"] for r in items], default=0) + 1
+        tip = items[0]["hash"] if items else "GENESIS"
+        r = _mint_receipt(self.tid, oldest_kid, key_hex, seq, tip,
+                          "read_file", "allow")
+        code, stored = http("POST", self.rc_url + "/v1/ingest", r,
+                            headers=self._svc())
+        self.assertEqual(code, 201, stored)
+
+        # the chain verifies end-to-end with the oldest key's signature
+        code, vf = http("GET",
+                        self.rc_url + f"/v1/verify?tenant_id={self.tid}",
+                        headers=self._svc())
+        self.assertEqual(code, 200, vf)
+        self.assertTrue(vf["chain_ok"], vf)
+
+    def test_08b_service_token_scope_matrix(self):
+        # M-1: every service token carries only the scopes it needs.
+        # 401 = bad token, 403 = valid token outside its scope.
+        def get(path, token):
+            code, _ = http("GET", self.cp_url + path,
+                           headers={"Authorization": f"Bearer {token}"})
+            return code
+
+        kb = f"/internal/tenants/{self.tid}/key-bundle"
+        pol = f"/internal/policies/bundle?tenant_id={self.tid}"
+        st = f"/internal/tenants/{self.tid}/status"
+
+        # raw HMAC key material: gatekeeper + receipt service only
+        self.assertEqual(get(kb, self.gk_token), 200)
+        self.assertEqual(get(kb, self.svc_token), 200)
+        self.assertEqual(get(kb, self.runner_token), 403)   # runner: no keys
+        self.assertEqual(get(kb, self.billing_token), 403)   # billing: no keys
+
+        # policy bundles: gatekeeper only
+        self.assertEqual(get(pol, self.gk_token), 200)
+        self.assertEqual(get(pol, self.svc_token), 403)
+        self.assertEqual(get(pol, self.runner_token), 403)
+        self.assertEqual(get(pol, self.billing_token), 403)
+
+        # desired state: runner + gatekeeper
+        self.assertEqual(get("/internal/desired-state", self.runner_token), 200)
+        self.assertEqual(get("/internal/desired-state", self.gk_token), 200)
+        self.assertEqual(get("/internal/desired-state", self.svc_token), 403)
+        self.assertEqual(get("/internal/desired-state", self.billing_token), 403)
+
+        # tenant status: billing only (status-only endpoint, M-1)
+        self.assertEqual(get(st, self.billing_token), 200)
+        self.assertEqual(get(st, self.runner_token), 403)
+        self.assertEqual(get(st, self.svc_token), 403)
+        self.assertEqual(get(st, self.gk_token), 403)
+
+        # platform key: gatekeeper deployment verifier only
+        pk = "/internal/platform/deployment-token-key"
+        self.assertEqual(get(pk, self.gk_token), 200)
+        self.assertEqual(get(pk, self.runner_token), 403)
+        self.assertEqual(get(pk, self.svc_token), 403)
+        self.assertEqual(get(pk, self.billing_token), 403)
+
+        # auth failures are 401, not 403
+        self.assertEqual(get("/internal/desired-state", "nope"), 401)
+        code, _ = http("GET", self.cp_url + "/internal/desired-state")
+        self.assertEqual(code, 401)
+
+    def test_08c_oversized_bodies_rejected(self):
+        # M-2: >1MB bodies are refused (413) on the gatekeeper /mcp and
+        # the control-plane JSON API, before any auth/policy work.
+        code = _raw_oversized_status(
+            self.gk_url, "/mcp", self._tenant_headers("deploy-staging"))
+        self.assertEqual(code, 413)
+        code = _raw_oversized_status(
+            self.cp_url, "/v1/deployments", self._auth())
+        self.assertEqual(code, 413)
 
     def test_09_api_keys_crud(self):
         code, created = http("POST", self.cp_url + "/v1/api-keys",

@@ -528,6 +528,52 @@ class EmitterUnitTest(unittest.TestCase):
                               os.path.join(TMP, "u6.jsonl"))
         self.assertEqual(em._try_ingest({"seq": 1}), "failed")
 
+    def test_hung_service_stalls_only_that_tenant(self):
+        # Per-tenant locks: the seq reservation (build -> ingest -> commit)
+        # spans the HTTP call, so a hung receipt service must stall only
+        # the affected tenant — never the whole gatekeeper.
+        class AnyRegistry:
+            def signing_key(self, tenant_id):
+                return "k1", b"\x00" * 32
+
+            def verification_keys(self, tenant_id):
+                return {"k1": b"\x00" * 32}
+
+        reg = AnyRegistry()
+        log = ReceiptLog(os.path.join(TMP, "iso.jsonl"), reg)
+        em = ReceiptEmitter(reg, log, svc_url="http://127.0.0.1:9",
+                            svc_token="t", flush_interval=3600)
+        em.close()  # no background flushing
+        gate = threading.Event()
+
+        def fake_try(receipt):
+            if receipt["tenant_id"] == "slow":
+                gate.wait(10)  # simulate a hung receipt service
+                return "failed"
+            return "ok"
+
+        em._try_ingest = fake_try
+        results = {}
+
+        def emit_slow():
+            results["slow"] = em.emit(
+                **{**self._fields(), "tenant_id": "slow"})
+
+        t = threading.Thread(target=emit_slow, daemon=True)
+        t.start()
+        time.sleep(0.5)  # let the slow emit block inside its ingest
+        start = time.monotonic()
+        fast = em.emit(**{**self._fields(), "tenant_id": "fast"})
+        elapsed = time.monotonic() - start
+        gate.set()
+        t.join(timeout=15)
+        # the healthy tenant sailed through while the other was hung
+        self.assertNotIn("local_fallback", fast)
+        self.assertLess(elapsed, 5,
+                        "healthy tenant was blocked by the hung tenant")
+        # the hung tenant fell back to the local file once ingest failed
+        self.assertIn("local_fallback", results["slow"])
+
 
 if __name__ == "__main__":
     unittest.main()

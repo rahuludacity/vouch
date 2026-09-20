@@ -24,7 +24,10 @@ import threading
 import time
 
 DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "..", "tenants.json")
-MAX_PREVIOUS_KEYS = 3  # how many retired keys stay verifiable
+# NOTE (H-2 fix, 2026-09-20): retired keys are NEVER pruned. Key rows are
+# tiny; proof is the product. Deleting a retired key would silently destroy
+# verifiability of every receipt signed with it, so the full key history is
+# retained indefinitely.
 
 
 class TenantRegistry:
@@ -77,9 +80,10 @@ class TenantRegistry:
             return kid, t["keys"][kid]
 
     def rotate(self, tenant_id):
-        """Mint a new current key; retired keys stay verifiable.
+        """Mint a new current key; retired keys stay verifiable forever.
 
-        Returns (new_kid, new_key_hex)."""
+        Returns (new_kid, new_key_hex). Retired keys are never deleted:
+        every receipt ever signed stays verifiable (H-2 fix)."""
         with self._lock:
             t = self._require(tenant_id)
             n = 1
@@ -89,10 +93,8 @@ class TenantRegistry:
                 kid = f"k{n}"
             t["keys"][kid] = secrets.token_hex(32)
             t["current_kid"] = kid
-            # prune: keep current + newest MAX_PREVIOUS_KEYS retired keys
-            ordered = sorted(t["keys"], key=lambda k: int(k[1:]))
-            keep = set(ordered[-(1 + MAX_PREVIOUS_KEYS):])
-            t["keys"] = {k: v for k, v in t["keys"].items() if k in keep}
+            # No pruning: the full key history is retained so historical
+            # receipts verify indefinitely (H-2 fix, 2026-09-20).
             t["rotated_at"] = round(time.time(), 3)
             self._save()
             return kid, t["keys"][kid]

@@ -82,6 +82,10 @@ DEP_JSON=$(curl -s -X POST "http://127.0.0.1:$CP/v1/deployments" \
   -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
   -d '{"task_id":"deploy-staging","agent_image":"vouch/agent-demo:latest"}')
 DEP_ID=$(python3 -c "import json,sys; print(json.load(sys.stdin)['deployment_id'])" <<<"$DEP_JSON")
+# H-1: the control plane mints a per-deployment gatekeeper credential at
+# creation (shown once). The runner fetches it for container injection;
+# the manual agent run below presents it the same way the container would.
+DEP_TOKEN=$(python3 -c "import json,sys; print(json.load(sys.stdin)['deployment_token'])" <<<"$DEP_JSON")
 echo "deployment: $DEP_ID"
 
 echo "=== 6. runner launches the agent (fake docker) ==="
@@ -93,6 +97,7 @@ RUNNER_DOCKER_FAKE=1 \
 echo "=== 7. the run: allowed calls pass, the destructive call is blocked ==="
 sleep 8
 VOUCH_TENANT="$TID" VOUCH_TENANT_ID="$TID" \
+  VOUCH_DEPLOYMENT_TOKEN="$DEP_TOKEN" \
   GATEKEEPER_URL="http://127.0.0.1:$GK/mcp" \
   VOUCH_TASK_ID="deploy-staging" VOUCH_AGENT_ID="agent-quickstart" \
   python3 demo/agent_sim.py 2>&1 | grep -v "^  connected" | head -12

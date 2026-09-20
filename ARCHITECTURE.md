@@ -145,6 +145,16 @@ for desired state; reports status back. Injects `GATEKEEPER_URL`, `VOUCH_TENANT_
 `VOUCH_TASK_ID`, `VOUCH_AGENT_ID` into the agent environment so the agent's MCP
 client routes through the gatekeeper with correct identity headers.
 
+**Docker socket = privileged.** The runner mounts `/var/run/docker.sock` to
+create agent containers — that socket is root-equivalent on the host (any
+writer can start a `--privileged` container and escape). Treat the runner
+host as a privileged control-plane component: harden it like the control
+plane, never co-locate it with untrusted workloads, and in production put
+it behind the same network policy as the other services. The `:ro` mount
+flag does not restrict the Docker API itself. Agent containers, by
+contrast, are fully unprivileged (non-root user, read-only root, all
+capabilities dropped, no-new-privileges, internal network only).
+
 ### 2.6 dashboard (`web/dashboard/`, :3000) — Crew B — BUILT (Phase 4)
 
 Live action feed, audit trail search, policy editor, tenant/key management,
@@ -219,9 +229,10 @@ status TEXT ('active'|'suspended'), stripe_customer_id TEXT NULL, created_at REA
 tenant_id TEXT, kid TEXT, key_hex TEXT, is_current INTEGER (0/1),
 created_at REAL, retired_at REAL NULL
 ```
-PK `(tenant_id, kid)`. Invariant: exactly one `is_current=1` per tenant; at most
-4 rows per tenant (current + 3 retired, mirrors v1 `MAX_PREVIOUS_KEYS`). Local file
-perms equivalent: DB file `0600`. (Production later: KMS — not this spec.)
+PK `(tenant_id, kid)`. Invariant: exactly one `is_current=1` per tenant; the full
+key history is retained **indefinitely** — retired keys are never deleted, so every
+receipt ever signed stays verifiable (proof is the product; key rows are tiny).
+Local file perms equivalent: DB file `0600`. (Production later: KMS — not this spec.)
 
 ### api_keys
 ```
@@ -250,6 +261,17 @@ id TEXT PK, name TEXT, token_hash TEXT UNIQUE, scope TEXT, created_at REAL
 ```
 Seeds one token per internal consumer (`receipt-service`, `runner`, `gatekeeper`,
 `billing`) via `controlplane seed-tokens` CLI; distributed as env vars in compose.
+Every token carries a least-privilege scope set, enforced per endpoint
+(401 = bad token, 403 = valid token outside its scope):
+- `receipt-service`: `keys:read,cache:invalidate`
+- `runner`: `deployments:read,deployments:status,cache:invalidate`
+- `gatekeeper`: `keys:read,deployment:verify,deployments:read,policies:read,cache:invalidate`
+- `billing`: `tenant:admin,cache:invalidate`
+
+A leaked runner or billing token cannot dump tenant HMAC key material
+(`keys:read` is gatekeeper + receipt-service only); billing reads tenant status
+through a status-only endpoint (`GET /internal/tenants/{id}/status`, `tenant:admin`)
+rather than the key bundle. Rotate with `seed_tokens --rotate`.
 
 ---
 
@@ -326,7 +348,8 @@ decided them.
   `usage` is fanned in from the receipt service (`GET /internal/usage/{tenant_id}?month=`
   on `RECEIPT_SVC_URL` with the fan-in bearer) — dashboard reads usage here, never from billing.
 - `POST /v1/tenants/me/rotate-keys` → `{"new_kid":"k4"}` (new kid **only** — key material
-  never leaves the server). Old kids stay verifiable (current + up to 3 retired, §3).
+  never leaves the server). The full key history is retained indefinitely (§3);
+  receipts signed by any retired key stay verifiable forever.
   Rotation pushes a cache invalidation, so the next gated call signs with the new kid.
 - `POST /v1/api-keys` `{"name":"ci"}` → `{"id","api_key":"vouch_sk_…","name":"ci"}`
   (plaintext shown once; only the hash is stored). Keys are **named** so CI, human, and
@@ -335,7 +358,13 @@ decided them.
   (metadata only — no hashes, no plaintext)
 - `DELETE /v1/api-keys/{id}` → `204` (revokes; subsequent calls with that key get 401)
 - `POST /v1/deployments` `{"task_id":"deploy-staging","agent_image":"vouch/agent-demo:latest"}`
-  → `{"deployment_id":"dep_…","status":"pending"}`
+  → `{"deployment_id":"dep_…","status":"pending","deployment_token":"vouch_dep_…"}`.
+  The deployment credential is **shown once** here (like the tenant API key —
+  only the HMAC is stored server-side). The runner re-fetches it any time via
+  the scoped internal endpoint `GET /internal/deployments/{id}/credential`
+  (`deployments:read`); it is never exposed to tenants again. `DELETE`
+  (stop) revokes the credential immediately, so a stopped deployment's agent
+  is locked out of the gatekeeper on its next call.
 - `GET /v1/deployments` / `GET /v1/deployments/{id}` / `DELETE /v1/deployments/{id}` (→ stops container)
 - Internal, service-token: `GET /internal/tenants/{id}/keys` → `{"current_kid":"k3","keys":{"k1":"hex…",…}}`
   (receipt service's verify path — the tenant-scoped twin of the gatekeeper key bundle, §4.7)
@@ -413,8 +442,9 @@ deny:
 ```
 
 Constraint ops (closed set — unknown op → `422` on PUT, never evaluated):
-`equals`, `prefix`, `regex` (RE2-style, no backtracking; compiled once at load),
-`in` (list), `range` (`{min,max}`, numeric), `required` (arg must be present).
+`equals`, `prefix`, `regex` (RE2-style subset + catastrophic-shape rejection at
+load, watchdog-guarded at runtime — see below), `in` (list), `range`
+(`{min,max}`, numeric), `required` (arg must be present).
 An `args` block matches iff **every** listed constraint matches (AND); a rule
 matches iff tool matches AND args block matches (empty/missing `args` = tool-only,
 v1 semantics). Omitted `args` key ≡ `{}`.
@@ -441,6 +471,29 @@ can then add `args` constraints incrementally. `PUT /v1/policies/{task}` accepts
 only v2 schema (the dashboard policy editor writes v2). The demo `policy.yaml`
 stays v1-format as a permanent compatibility fixture — `tests/test_policy_v2.py`
 must cover: v1 upgrade equivalence, deny-wins, arg constraints, unknown-op rejection.
+
+### 5.4 Regex safety (three layers)
+
+The policy language promises RE2-style patterns, but the stdlib engine backtracks —
+a tenant-supplied `(a+)+$` must never hang the gatekeeper:
+1. **Load time:** patterns with backreferences, lookaround/conditional groups, or
+   **catastrophic shapes** (nested quantifiers like `(a+)+$`, quantified
+   alternations like `(a|aa)+$`) are rejected with `PolicyError` — the operator
+   sees it at policy load and rewrites the pattern (e.g. `[ab]+` instead of
+   `(a|b)+`). Conservative: some safe patterns are rejected too; that fails
+   closed where the operator can see it.
+2. **Match time:** values longer than 4096 chars fail closed (tool args are short).
+3. **Preemptive watchdog:** every match runs in a worker **process** (bounded
+   pool of 8) under a 0.25s kill-on-timeout; a timeout raises `RegexTimeout`,
+   which `decide()` turns into a **deny** (fail closed for allow *and* deny
+   rules — a timed-out deny rule must not silently permit). Processes, not
+   threads, deliberately: CPython's `re` engine never releases the GIL during
+   a match, so a thread-pool watchdog cannot bound a catastrophic match —
+   the waiting thread can't even wake up to notice the timeout (measured:
+   59s elapsed against a 0.25s budget). A worker process is preempted by the
+   OS, so the parent always wakes on time and SIGTERMs the runaway; the
+   pool spawns a replacement on next checkout. A runaway can never wedge
+   the gatekeeper or starve other tenants' requests.
 
 ---
 
@@ -512,18 +565,31 @@ ARCHITECTURE.md        # this file
 
 ---
 
-## 8. Auth model (three credential types — do not mix)
+## 8. Auth model (four credential types — do not mix)
 
 1. **Tenant API keys** `vouch_sk_*` — what customers put in dashboards/SDKs. Scope: their
    tenant only, on control-plane and receipt-service tenant endpoints.
 2. **Service tokens** — long random bearers, one per internal consumer, minted by
    `controlplane seed-tokens`, injected as env (`RECEIPT_SVC_TOKEN`, `RUNNER_TOKEN`,
-   `GATEKEEPER_SVC_TOKEN`, `BILLING_SVC_TOKEN`). Scope: `/internal/*` and `/v1/ingest` only.
-3. **Stripe test keys** — billing only, `sk_test_*` / test webhook secret. Never leave test mode
+   `GATEKEEPER_SVC_TOKEN`, `BILLING_SVC_TOKEN`). Scope: `/internal/*` and `/v1/ingest`
+   only, with per-token least-privilege scopes (§3, service_tokens).
+3. **Deployment credentials** `vouch_dep_*` — per-deployment bearer minted at
+   deployment creation, HMAC-bound (platform key) to deployment ID + tenant ID +
+   issue epoch, stored server-side, revoked on deployment stop. The runner fetches
+   it via the control plane and injects it as `VOUCH_DEPLOYMENT_TOKEN`; the agent
+   sends it as `X-Deployment-Token`. In control-plane mode the gatekeeper's
+   `/mcp` **requires** it: missing/malformed/forged/mismatched/revoked → 403.
+   The credential's tenant is authoritative — a supplied `X-Tenant-Id` must match
+   it. Self-asserted tenant/agent/task identity is never trusted on its own.
+   (Legacy file-backed mode keeps the v1 header behavior for local demos.)
+4. **Stripe test keys** — billing only, `sk_test_*` / test webhook secret. Never leave test mode
    without Rahul's explicit approval (and never in this build phase at all).
 
-Gatekeeper request identity stays header-based (`X-Tenant-Id` etc.) exactly as v1 —
-the runner injects them from env; that path is unchanged.
+Gatekeeper request identity in control-plane mode is credential-based (3), not
+header-based: `X-Tenant-Id`/`X-Task-Id`/`X-Agent-Id` are hints validated against
+the deployment credential. The runner injects both the identity env vars and the
+deployment token from the control plane; that path is unchanged apart from the
+added credential.
 
 ---
 
@@ -597,7 +663,25 @@ with Crew A phases 1–3 against the frozen contracts + stubs.
    byte-for-byte compatibility is a release gate.
 5. **Keys stay server-side.** Tenant HMAC keys never appear in dashboard responses,
    logs, or the receipt stream. `rotate-keys` returns only the new `kid`.
-6. **Deny before execute, always.** No async policy checks on the enforcement path;
-   no "allow then audit". The receipt is written before the upstream call returns.
+   Service-to-service key material moves only over scoped `/internal/*`
+   endpoints (§3, service_tokens).
+6. **Deny before execute, always; receipt before upstream, always.** No async policy
+   checks on the enforcement path; no "allow then audit". The allow receipt is
+   emitted **before** the upstream call is made — it records the authorization /
+   execution intent, not the upstream result — so a crash between authorization
+   and forward can never produce an action with no receipt.
 7. **Two-crew rule:** Crew A never blocks on Crew B's UI; Crew B never waits on
    Crew A's services (stubs). Integration happens at phase exits, against §4.
+8. **1MB request body cap everywhere.** Every service (gatekeeper, control plane,
+   receipt service, runner, dashboard, billing) rejects bodies over 1,000,000
+   bytes with `413` before allocating or authenticating — a client-controlled
+   `Content-Length` must never drive an unbounded `rfile.read()` against
+   `ThreadingHTTPServer`'s unbounded thread pool. Malformed `Content-Length`
+   → `400`.
+9. **No dev defaults in production paths.** The receipt service refuses to boot
+   with the `dev-token` default unless `VOUCH_ALLOW_DEV_DEFAULTS=1` (local demos
+   only). All services bind `127.0.0.1` by default, overridable per-service via
+   `VOUCH_BIND` — host networking is a local-development posture, not a
+   deployment posture. Agent containers run on a non-host internal network,
+   read-only root, all capabilities dropped, `no-new-privileges`, non-root user,
+   and require the deployment credential to build.

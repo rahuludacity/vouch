@@ -27,7 +27,9 @@ this to the control plane in Phase 2). Key material never leaves the server.
 Run:  python3 -m services.receipts.app
 Env:  RECEIPT_PORT        (default 9001)
       RECEIPT_DB          sqlite path (default <repo>/receipts.db)
-      RECEIPT_SVC_TOKEN   bearer token (default "dev-token"; set in prod)
+      RECEIPT_SVC_TOKEN   bearer token — REQUIRED in production: the service
+                          refuses to boot with the dev default unless
+                          VOUCH_ALLOW_DEV_DEFAULTS=1 (see M-5 note in main()).
       TENANTS_PATH        tenant registry (default <repo>/tenants.json)
       CONTROLPLANE_URL    control plane base (default ""; when set, verify
                           fetches tenant keys from the control plane per §4.7,
@@ -37,7 +39,9 @@ Env:  RECEIPT_PORT        (default 9001)
 """
 import json
 import os
+import sys
 import hashlib
+import hmac
 import queue
 import threading
 import time
@@ -51,6 +55,7 @@ from . import keys as keys_module
 from .keys import load_verification_keys, KeyAuthorityUnavailable
 
 HERE = os.path.dirname(__file__)
+BIND = os.environ.get("VOUCH_BIND", "127.0.0.1")
 PORT = int(os.environ.get("RECEIPT_PORT", "9001"))
 DB_PATH = os.environ.get(
     "RECEIPT_DB", os.path.join(HERE, "..", "..", "receipts.db"))
@@ -98,8 +103,10 @@ class Handler(BaseHTTPRequestHandler):
     def _authed(self):
         if self.svc_token in (None, ""):
             return True  # no token configured: open (local dev only)
-        return (self.headers.get("Authorization", "") ==
-                f"Bearer {self.svc_token}")
+        # L-1: constant-time comparison.
+        return hmac.compare_digest(
+            self.headers.get("Authorization", ""),
+            f"Bearer {self.svc_token}")
 
     def _require_auth(self):
         if not self._authed():
@@ -120,7 +127,8 @@ class Handler(BaseHTTPRequestHandler):
         if not auth.startswith("Bearer "):
             return None
         token = auth[7:]
-        if self.svc_token and token == self.svc_token:
+        # L-1: constant-time comparison for the service bearer.
+        if self.svc_token and hmac.compare_digest(token, self.svc_token):
             return ("service", None)
         if token.startswith("vouch_sk_") and self.controlplane_url:
             tid = self._introspect_tenant_key(token)
@@ -173,7 +181,13 @@ class Handler(BaseHTTPRequestHandler):
         return u.path, {k: v[0] for k, v in parse_qs(u.query).items()}
 
     def _read_json(self):
-        length = int(self.headers.get("Content-Length", 0) or 0)
+        # M-2: 1MB request cap — reject before allocating.
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            return "INVALID"
+        if length > 1_000_000:
+            return "TOO_LARGE"
         if not length:
             return None
         try:
@@ -370,6 +384,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self._require_auth():
             return
         body = self._read_json()
+        if body == "TOO_LARGE":
+            return self._err(413, "payload_too_large",
+                             "request body exceeds 1MB")
         if body is None or body == "INVALID" or not isinstance(body, dict):
             return self._err(400, "invalid_receipt", "body must be a JSON object")
         missing = [f for f in REQUIRED_FIELDS if f not in body]
@@ -400,6 +417,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # M-5: refuse to boot with the dev default outside the local-dev
+    # escape hatch. Receipt ingestion accepts signed receipts on the
+    # strength of this Bearer <redacted> — "dev-token" in production would
+    # let anyone forge the chain.
+    if SVC_TOKEN == "dev-token" and os.environ.get("VOUCH_ALLOW_DEV_DEFAULTS") != "1":
+        print("FATAL: RECEIPT_SVC_TOKEN is the dev default 'dev-token'. "
+              "Set a real secret, or export VOUCH_ALLOW_DEV_DEFAULTS=1 for "
+              "local demos only.", file=sys.stderr)
+        sys.exit(2)
     if SVC_TOKEN == "dev-token":
         print("WARNING: RECEIPT_SVC_TOKEN not set, using default 'dev-token'. "
               "Set it in production.")
@@ -408,14 +434,14 @@ def main():
     Handler.svc_token = SVC_TOKEN
     Handler.controlplane_url = CONTROLPLANE_URL
     Handler.cp_token = CP_SVC_TOKEN
-    print(f"vouch receipt service listening on :{PORT}")
+    print(f"vouch receipt service listening on {BIND}:{PORT}")
     print(f"db:      {DB_PATH}")
     print(f"tenants: {TENANTS_PATH}")
     if CONTROLPLANE_URL:
         print(f"key authority: control plane at {CONTROLPLANE_URL} (file fallback)")
     else:
         print("key authority: tenants.json file")
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":

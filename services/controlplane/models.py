@@ -25,7 +25,11 @@ DEPLOYMENT_STATUSES = ("pending", "running", "stopped", "failed")
 
 API_KEY_PREFIX = "vouch_sk_"
 SVC_TOKEN_PREFIX = "vouch_svc_"
-MAX_KEYS_PER_TENANT = 4  # current + 3 retired, mirrors v1 tenants.json
+DEP_TOKEN_PREFIX = "vouch_dep_"
+# NOTE (H-2 fix, 2026-09-20): retired tenant keys are NEVER pruned — the
+# full key history is retained so historical receipts verify indefinitely.
+# (There used to be a MAX_KEYS_PER_TENANT = 4 cap; it silently destroyed
+# verifiability after the 4th rotation and was removed.)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tenants (
@@ -88,6 +92,30 @@ CREATE TABLE IF NOT EXISTS service_tokens (
   scope TEXT NOT NULL DEFAULT 'internal',
   created_at REAL NOT NULL
 );
+-- Phase 7 (H-1): per-deployment gatekeeper credentials. The control plane
+-- mints one opaque bearer per deployment at creation; the runner injects it
+-- into the agent container as VOUCH_DEPLOYMENT_TOKEN and the gatekeeper
+-- validates it before honoring X-Tenant-Id/X-Agent-Id/X-Task-Id. token is
+-- stored plaintext like tenant key material (the DB file is chmod 0600);
+-- token_hash supports revocation bookkeeping. revoked_at is set when the
+-- deployment is stopped/deleted.
+CREATE TABLE IF NOT EXISTS deployment_tokens (
+  deployment_id TEXT PRIMARY KEY REFERENCES deployments(id),
+  tenant_id TEXT NOT NULL REFERENCES tenants(id),
+  token TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  issued_at REAL NOT NULL,
+  revoked_at REAL
+);
+-- Phase 7 (H-1): platform-level signing keys. deployment_token_signing is
+-- the HMAC key the control plane uses to sign deployment tokens and the
+-- gatekeeper uses to verify them (fetched over the internal API, never
+-- shipped to agents). Generated once, persisted here.
+CREATE TABLE IF NOT EXISTS platform_keys (
+  name TEXT PRIMARY KEY,
+  key_hex TEXT NOT NULL,
+  created_at REAL NOT NULL
+);
 """
 
 
@@ -138,18 +166,25 @@ class ControlPlaneDB:
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
+            # WAL mode: readers never block writers (L-3 robustness fix).
+            self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(SCHEMA)
             self._conn.commit()
         os.chmod(self.path, 0o600)
 
     # ------------------------------------------------------------ internals
     def _one(self, sql, params=()):
-        cur = self._conn.execute(sql, params)
-        row = cur.fetchone()
-        return dict(row) if row else None
+        # Reads take the lock too: under ThreadingHTTPServer a concurrent
+        # writer could otherwise raise "database is locked" or serve a torn
+        # read (L-3 fix). RLock keeps nested model calls deadlock-free.
+        with self._lock:
+            cur = self._conn.execute(sql, params)
+            row = cur.fetchone()
+            return dict(row) if row else None
 
     def _all(self, sql, params=()):
-        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
 
     def _write(self, sql, params=()):
         with self._lock:
@@ -231,9 +266,11 @@ class ControlPlaneDB:
 
     # ------------------------------------------------------------------ keys
     def rotate_keys(self, tenant_id):
-        """Mint a new current HMAC key; retired keys stay verifiable.
+        """Mint a new current HMAC key; retired keys stay verifiable forever.
 
-        Keeps at most MAX_KEYS_PER_TENANT (current + 3 retired), mirroring v1.
+        The full key history is retained — retired keys are never deleted,
+        so every receipt ever signed stays verifiable (H-2 fix). Key rows
+        are tiny; proof is the product.
         Returns the new kid, or None for unknown tenant.
         """
         with self._lock:
@@ -261,18 +298,8 @@ class ControlPlaneDB:
                 " created_at) VALUES (?, ?, ?, 1, ?)",
                 (tenant_id, new_kid, secrets.token_hex(32), now),
             )
-            # prune oldest retired beyond the keep window
-            rows = self._all(
-                "SELECT kid, is_current FROM tenant_keys WHERE tenant_id = ?"
-                " ORDER BY CAST(SUBSTR(kid, 2) AS INTEGER)",
-                (tenant_id,),
-            )
-            retired = [r["kid"] for r in rows if not r["is_current"]]
-            for kid in retired[: max(0, len(retired) - (MAX_KEYS_PER_TENANT - 1))]:
-                self._conn.execute(
-                    "DELETE FROM tenant_keys WHERE tenant_id = ? AND kid = ?",
-                    (tenant_id, kid),
-                )
+            # No pruning: every retired key stays verifiable indefinitely
+            # (H-2 fix, 2026-09-20).
             self._conn.commit()
             return new_kid
 
@@ -432,6 +459,92 @@ class ControlPlaneDB:
         }
 
     # ------------------------------------------------------------ deployments
+    def _deployment_signing_key(self):
+        """Platform HMAC key that signs deployment tokens (H-1).
+
+        Generated once and persisted in platform_keys; the gatekeeper
+        fetches it over the scoped internal API to verify tokens without a
+        per-request control-plane round trip. Never shipped to agents.
+        """
+        with self._lock:
+            row = self._one(
+                "SELECT key_hex FROM platform_keys WHERE name = ?",
+                ("deployment_token_signing",))
+            if row:
+                return row["key_hex"]
+            key_hex = secrets.token_hex(32)
+            self._conn.execute(
+                "INSERT INTO platform_keys (name, key_hex, created_at)"
+                " VALUES (?, ?, ?)",
+                ("deployment_token_signing", key_hex, _utcnow()))
+            self._conn.commit()
+            return key_hex
+
+    def get_deployment_signing_key(self):
+        """Hex HMAC key for deployment tokens — service-token (scoped) only."""
+        return self._deployment_signing_key()
+
+    @staticmethod
+    def _build_deployment_token(deployment_id, tenant_id, signing_key_hex):
+        """Self-contained deployment credential (H-1).
+
+        Format: vouch_dep_<deployment_id>_<tenant_id>_<issued>_<sig>
+        sig = HMAC-SHA256(signing_key,
+                          "<deployment_id>.<tenant_id>.<issued>")[:32 hex chars].
+        The gatekeeper verifies the HMAC with the platform key (no per-request
+        network), then checks the (deployment_id -> tenant_id, status) binding
+        against the control plane (cached, revocation-aware).
+        """
+        issued = int(_utcnow())
+        mac = hmac.new(
+            bytes.fromhex(signing_key_hex),
+            f"{deployment_id}.{tenant_id}.{issued}".encode("utf-8"),
+            hashlib.sha256).hexdigest()[:32]
+        return f"{DEP_TOKEN_PREFIX}{deployment_id}_{tenant_id}_{issued}_{mac}"
+
+    def mint_deployment_token(self, deployment_id, tenant_id):
+        """(Re-)issue the deployment credential; returns the plaintext token.
+
+        The plaintext is stored like tenant key material (DB is chmod 0600)
+        so the runner can fetch it for container injection at any time.
+        """
+        token = self._build_deployment_token(
+            deployment_id, tenant_id, self._deployment_signing_key())
+        self._write(
+            "INSERT INTO deployment_tokens"
+            " (deployment_id, tenant_id, token, token_hash, issued_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(deployment_id) DO UPDATE SET"
+            " tenant_id = excluded.tenant_id, token = excluded.token,"
+            " token_hash = excluded.token_hash, issued_at = excluded.issued_at,"
+            " revoked_at = NULL",
+            (deployment_id, tenant_id, token, _sha256_hex(token), _utcnow()),
+        )
+        return token
+
+    def get_deployment_token(self, deployment_id):
+        """Plaintext credential for runner injection, or None.
+
+        Runner-scoped internal endpoint only — this is a bearer credential,
+        not key material, but it is never exposed to tenants.
+        """
+        row = self._one(
+            "SELECT token, revoked_at FROM deployment_tokens WHERE"
+            " deployment_id = ?",
+            (deployment_id,),
+        )
+        if not row or row["revoked_at"] is not None:
+            return None
+        return row["token"]
+
+    def revoke_deployment_token(self, deployment_id):
+        """Revoke the credential (deployment stopped/deleted). Idempotent."""
+        self._write(
+            "UPDATE deployment_tokens SET revoked_at = ?"
+            " WHERE deployment_id = ? AND revoked_at IS NULL",
+            (_utcnow(), deployment_id),
+        )
+
     def create_deployment(self, tenant_id, task_id, agent_image):
         if not isinstance(task_id, str) or not task_id.strip():
             raise ValueError("task_id must be a non-empty string")
@@ -445,7 +558,20 @@ class ControlPlaneDB:
             " status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
             (dep_id, tenant_id, task_id.strip(), agent_image.strip(), _utcnow()),
         )
-        return {"deployment_id": dep_id, "status": "pending"}
+        # H-1: every deployment gets its gatekeeper credential at creation.
+        # Shown once here; the runner re-fetches it via the scoped internal
+        # credential endpoint for container injection.
+        token = self.mint_deployment_token(dep_id, tenant_id)
+        return {"deployment_id": dep_id, "status": "pending",
+                "deployment_token": token}
+
+    def get_deployment_any(self, dep_id):
+        """Deployment row regardless of tenant (internal, scoped)."""
+        return self._one(
+            "SELECT id, tenant_id, task_id, agent_image, status, container_id,"
+            " last_heartbeat, created_at FROM deployments WHERE id = ?",
+            (dep_id,),
+        )
 
     def list_deployments(self, tenant_id):
         return self._all(
@@ -468,7 +594,11 @@ class ControlPlaneDB:
             "UPDATE deployments SET status = 'stopped' WHERE id = ? AND tenant_id = ?",
             (dep_id, tenant_id),
         )
-        return cur.rowcount > 0
+        if cur.rowcount:
+            # H-1: a stopped deployment's gatekeeper credential dies with it.
+            self.revoke_deployment_token(dep_id)
+            return True
+        return False
 
     def set_deployment_status(self, dep_id, status, container_id=None):
         if status not in DEPLOYMENT_STATUSES:
@@ -499,6 +629,33 @@ class ControlPlaneDB:
         ]
 
     # ---------------------------------------------------------- service tokens
+    # Scopes (M-1 fix, 2026-09-20): every internal endpoint declares the
+    # scope(s) it requires and _require_service(*scopes) enforces them — a
+    # valid token outside its scope gets 403, and raw tenant HMAC key
+    # material is only ever served to the `keys:read` scope (gatekeeper and
+    # receipt service, which must sign/verify). Scope vocabulary:
+    #   keys:read         tenant key bundles / raw key material
+    #   deployment:verify platform deployment-token signing key + deployment
+    #                     binding lookups (gatekeeper only)
+    #   policies:read     tenant policy bundles (gatekeeper)
+    #   deployments:read  desired-state + deployment credential fetch (runner)
+    #   deployments:status deployment status callbacks (runner)
+    #   tenant:admin       plan / suspend endpoints (billing)
+    #   cache:invalidate  cache-invalidate relay (all internal consumers)
+    # The legacy scope "internal" (pre-Phase-7 DBs) grants everything, so
+    # old databases keep working until tokens are re-seeded with --rotate.
+    ALL_SCOPES = frozenset({
+        "keys:read", "deployment:verify", "policies:read",
+        "deployments:read", "deployments:status", "tenant:admin",
+        "cache:invalidate",
+    })
+
+    @classmethod
+    def _scopes_for(cls, scope_value):
+        if scope_value == "internal":
+            return set(cls.ALL_SCOPES)
+        return {s.strip() for s in (scope_value or "").split(",") if s.strip()}
+
     def seed_service_token(self, name, scope="internal"):
         """Mint a token; returns plaintext (shown once) or None if name taken."""
         if not isinstance(name, str) or not name.strip():
@@ -516,15 +673,17 @@ class ControlPlaneDB:
         return plaintext
 
     def validate_service_token(self, plaintext):
-        """-> token name, or None. Constant-time comparison."""
+        """-> (name, set_of_scopes), or (None, frozenset()).
+
+        Constant-time comparison (L-1)."""
         if not plaintext:
-            return None
+            return None, frozenset()
         digest = _sha256_hex(plaintext)
-        rows = self._all("SELECT name, token_hash FROM service_tokens")
+        rows = self._all("SELECT name, token_hash, scope FROM service_tokens")
         for r in rows:
             if hmac.compare_digest(r["token_hash"], digest):
-                return r["name"]
-        return None
+                return r["name"], self._scopes_for(r["scope"])
+        return None, frozenset()
 
     # ------------------------------------------------------------------ usage
     def get_usage(self, tenant_id, month):

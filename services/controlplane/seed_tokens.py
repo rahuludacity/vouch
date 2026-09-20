@@ -25,10 +25,16 @@ DEFAULT_DB = (os.environ.get("CONTROLPLANE_DB")
               or os.path.join(HERE, "..", "..", "data", "controlplane.db"))
 
 TOKENS = (
-    ("receipt-service", "RECEIPT_SVC_TOKEN"),
-    ("runner", "RUNNER_TOKEN"),
-    ("gatekeeper", "GATEKEEPER_SVC_TOKEN"),
-    ("billing", "BILLING_SVC_TOKEN"),
+    # (service name, env var, scopes) — M-1: least privilege per consumer.
+    # Only the gatekeeper and the receipt service ever see raw tenant HMAC
+    # key material (keys:read); the runner and billing tokens cannot.
+    ("receipt-service", "RECEIPT_SVC_TOKEN", "keys:read,cache:invalidate"),
+    ("runner", "RUNNER_TOKEN",
+     "deployments:read,deployments:status,cache:invalidate"),
+    ("gatekeeper", "GATEKEEPER_SVC_TOKEN",
+     "keys:read,deployment:verify,deployments:read,policies:read,"
+     "cache:invalidate"),
+    ("billing", "BILLING_SVC_TOKEN", "tenant:admin,cache:invalidate"),
 )
 
 
@@ -49,11 +55,11 @@ def main(argv):
 
     db = ControlPlaneDB(db_path)
     minted = {}
-    for name, env in TOKENS:
+    for name, env, scope in TOKENS:
         if rotate:
             # rotate = delete existing, then mint fresh below
             db._write("DELETE FROM service_tokens WHERE name = ?", (name,))
-        plaintext = db.seed_service_token(name)
+        plaintext = db.seed_service_token(name, scope=scope)
         if plaintext is None:
             print(f"# {name}: already exists (use --rotate to replace; not shown)")
         else:
@@ -62,6 +68,9 @@ def main(argv):
         print("# Service tokens — shown once. Export before starting services:")
         for env, token in minted.items():
             print(f"{env}={token}")
+    if not rotate:
+        print("# NOTE: tokens minted before Phase 7 carry the legacy 'internal'"
+              " scope (all endpoints). Re-run with --rotate to scope them.")
     return 0
 
 

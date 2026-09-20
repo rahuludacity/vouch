@@ -18,16 +18,38 @@ A background poller refreshes known tenants every POLICY_POLL_INTERVAL
 bundle reports a newer policy_version than the cached bundle.
 """
 import json
+import re
 import threading
 import time
 import urllib.request
 import urllib.error
+import hmac
+import hashlib
 
 from . import policy_v2
 
 KEY_TTL = 60.0
 KEY_STALE_MAX = 600.0
 _HTTP_TIMEOUT = 5
+# How long a (deployment_id -> tenant_id, status) binding is trusted before
+# re-checking with the control plane. Revocation (stop/delete) takes effect
+# within this window, or immediately via push-invalidate.
+DEP_BIND_TTL = 300.0
+# Deployment credential format (H-1):
+#   vouch_dep_<deployment_id>_<tenant_id>_<issued_epoch>_<sig32>
+# sig = HMAC-SHA256(platform deployment key,
+#                   "<deployment_id>.<tenant_id>.<issued>")[:32 hex].
+DEP_TOKEN_PREFIX = "vouch_dep_"
+_DEP_TOKEN_RE = re.compile(
+    r"^vouch_dep_(dep_[0-9a-f]{16})_(.+)_(\d+)_([0-9a-f]{32})$")
+
+
+def parse_deployment_token(token):
+    """-> (deployment_id, tenant_id, issued, sig), or None if malformed."""
+    m = _DEP_TOKEN_RE.fullmatch(token or "")
+    if not m:
+        return None
+    return m.group(1), m.group(2), int(m.group(3)), m.group(4)
 
 
 class ControlPlaneError(Exception):
@@ -226,3 +248,114 @@ class PolicyBundleCache:
                         pass
             except Exception:  # noqa: BLE001
                 pass
+
+
+class DeploymentTokenVerifier:
+    """Validates per-deployment gatekeeper credentials (H-1 fix).
+
+    Two steps, both must pass:
+      1. Self-contained HMAC check against the platform deployment-signing
+         key, fetched from the control plane
+         (GET /internal/platform/deployment-token-key, deployment:verify
+         scope) and cached with a 60s TTL / 10-minute stale-while-revalidate
+         window — same resilience posture as the key bundles.
+      2. Revocation-aware binding check: the deployment must still exist and
+         be pending/running for the token's tenant
+         (GET /internal/deployments/{id}), cached DEP_BIND_TTL (300s).
+
+    verify() returns the authoritative tenant_id, or None when the
+    credential is missing, malformed, forged, expired from cache, or
+    revoked. Fail closed: if the platform key cannot be obtained at all,
+    every token is rejected.
+    """
+
+    def __init__(self, base_url, token, ttl=KEY_TTL, stale_max=KEY_STALE_MAX,
+                 bind_ttl=DEP_BIND_TTL):
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.ttl = ttl
+        self.stale_max = stale_max
+        self.bind_ttl = bind_ttl
+        self._lock = threading.RLock()
+        self._key = None          # {"key": bytes, "fetched_at": float}
+        self._bindings = {}       # dep_id -> {"tenant_id", "status", "at"}
+
+    # ------------------------------------------------------------- fetching
+    def _fetch_signing_key(self):
+        data = _get_json(
+            f"{self.base_url}/internal/platform/deployment-token-key",
+            self.token)
+        key_hex = data.get("key_hex", "")
+        if len(key_hex) != 64:
+            raise ControlPlaneError("bad deployment-token-key payload")
+        return {"key": bytes.fromhex(key_hex), "fetched_at": time.time()}
+
+    def _signing_key(self):
+        """Platform key bytes, or None when unobtainable (fail closed)."""
+        now = time.time()
+        with self._lock:
+            k = self._key
+            if k and now - k["fetched_at"] < self.ttl:
+                return k["key"]
+        try:
+            fresh = self._fetch_signing_key()
+        except (ControlPlaneError, KeyError):
+            with self._lock:
+                k = self._key
+                if k and now - k["fetched_at"] < self.stale_max:
+                    return k["key"]
+            return None
+        with self._lock:
+            self._key = fresh
+            return fresh["key"]
+
+    def _fetch_binding(self, dep_id):
+        try:
+            data = _get_json(
+                f"{self.base_url}/internal/deployments/{dep_id}", self.token)
+        except KeyError:
+            return None  # unknown deployment -> revoked for our purposes
+        return {"tenant_id": data.get("tenant_id"),
+                "status": data.get("status"),
+                "at": time.time()}
+
+    def _binding(self, dep_id):
+        now = time.time()
+        with self._lock:
+            b = self._bindings.get(dep_id)
+            if b and now - b["at"] < self.bind_ttl:
+                return b
+        fresh = self._fetch_binding(dep_id)
+        with self._lock:
+            if fresh is None:
+                self._bindings.pop(dep_id, None)
+            else:
+                self._bindings[dep_id] = fresh
+            return fresh
+
+    def invalidate_binding(self, dep_id):
+        """Drop a cached deployment binding (push-invalidate hook)."""
+        with self._lock:
+            self._bindings.pop(dep_id, None)
+
+    # --------------------------------------------------------------- verify
+    def verify(self, token):
+        """-> authoritative tenant_id, or None when the credential is bad."""
+        parsed = parse_deployment_token(token)
+        if parsed is None:
+            return None
+        dep_id, tenant_id, issued, sig = parsed
+        key = self._signing_key()
+        if key is None:
+            return None  # fail closed: no key authority, no trust
+        expect = hmac.new(
+            key, f"{dep_id}.{tenant_id}.{issued}".encode("utf-8"),
+            hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(expect, sig):
+            return None
+        binding = self._binding(dep_id)
+        if (binding is None
+                or binding["tenant_id"] != tenant_id
+                or binding["status"] not in ("pending", "running")):
+            return None
+        return tenant_id

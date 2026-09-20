@@ -476,7 +476,21 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(s, 200)
         self.assertIn("Acme", body)
         # logout kills the session -> back to the login page
-        s, body, _ = http("POST", self.dash2 + "/logout", b"",
+        # L-2: logout requires the CSRF token from the rendered page.
+        import re
+        s, body, _ = http("GET", self.dash2 + "/overview", opener=op)
+        m = re.search(r'name="csrf_token" value="([^"]+)"', body)
+        self.assertTrue(m, "logout form must carry a CSRF token")
+        csrf = m.group(1)
+        # forged logout without the token is rejected
+        form = urllib.parse.urlencode({}).encode()
+        s, body, _ = http("POST", self.dash2 + "/logout", form,
+                          {"Content-Type":
+                           "application/x-www-form-urlencoded"}, opener=op)
+        self.assertEqual(s, 403)
+        # real logout with the token works
+        form = urllib.parse.urlencode({"csrf_token": csrf}).encode()
+        s, body, _ = http("POST", self.dash2 + "/logout", form,
                           {"Content-Type":
                            "application/x-www-form-urlencoded"}, opener=op)
         self.assertIn("Operator sign in", body)
@@ -518,6 +532,42 @@ class DashboardTest(unittest.TestCase):
         # cleanup: revoke the key created above (via operator dashboard)
         http("DELETE", self.dash + f"/api/keys/{new_id}")
 
+    def test_oversized_bodies_rejected(self):
+        # M-2: >1MB bodies are refused (413) on login, logout, and the
+        # JSON API — before any credential or session work.
+        # Uses a raw socket that declares an oversized Content-Length but
+        # sends only a partial body: urllib's full-body send races the
+        # server's early 413 and flakes with BrokenPipeError, while the
+        # raw socket proves the server decides on the headers alone.
+        from urllib.parse import urlparse
+        u = urlparse(self.dash2)
+        host, port = u.hostname, u.port or 80
+
+        def raw_status(path, ctype):
+            s = socket.create_connection((host, port), timeout=15)
+            try:
+                s.sendall(
+                    f"POST {path} HTTP/1.1\r\n"
+                    f"Host: {host}\r\n"
+                    f"Content-Type: {ctype}\r\n"
+                    f"Content-Length: 1000001\r\n"
+                    f"Connection: close\r\n\r\n".encode() + b"x" * 1024)
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                return int(resp.split(b" ", 2)[1])
+            finally:
+                s.close()
+
+        for path, ctype in (
+                ("/login", "application/x-www-form-urlencoded"),
+                ("/logout", "application/x-www-form-urlencoded"),
+                ("/api/session", "application/json")):
+            self.assertEqual(raw_status(path, ctype), 413, path)
+
     def test_key_plaintext_never_leaks(self):
         # HTML pages and JSON never render key material or plaintext.
         s, body, _ = http("GET", self.dash + "/keys")
@@ -526,6 +576,65 @@ class DashboardTest(unittest.TestCase):
         s, data, _ = http("GET", self.dash + "/api/keys")
         self.assertNotIn("key_hex", json.dumps(data))
         self.assertNotIn("BEGIN", json.dumps(data))
+
+
+class SessionSweepTest(unittest.TestCase):
+    """L-2: the expired-session sweeper (no server needed)."""
+
+    def test_sweep_removes_expired_keeps_live(self):
+        import time
+        import web.dashboard.app as dash
+        with dash._sessions_lock:
+            dash._sessions.clear()
+        live = dash._new_session("k1")
+        dead = dash._new_session("k2")
+        with dash._sessions_lock:
+            dash._sessions[dead]["exp"] = time.time() - 1
+        removed = dash._sweep_expired_sessions()
+        self.assertEqual(removed, 1)
+        self.assertIsNotNone(dash._get_session(live))
+        self.assertIsNone(dash._get_session(dead))
+        with dash._sessions_lock:
+            dash._sessions.clear()
+
+    def test_expired_session_rejected_on_access(self):
+        import time
+        import web.dashboard.app as dash
+        with dash._sessions_lock:
+            dash._sessions.clear()
+        sid = dash._new_session("k1")
+        with dash._sessions_lock:
+            dash._sessions[sid]["exp"] = time.time() - 1
+        self.assertIsNone(dash._get_session(sid))
+        with dash._sessions_lock:
+            dash._sessions.clear()
+
+
+class SecureCookieTest(unittest.TestCase):
+    """L-2: the Secure cookie attribute follows VOUCH_SECURE_COOKIE."""
+
+    def _suffix(self, policy, proto=""):
+        import web.dashboard.app as dash
+        h = object.__new__(dash.Handler)
+        h.headers = {"X-Forwarded-Proto": proto} if proto else {}
+        old = dash.SECURE_COOKIE
+        dash.SECURE_COOKIE = policy
+        try:
+            return h._secure_cookie_suffix()
+        finally:
+            dash.SECURE_COOKIE = old
+
+    def test_forced_secure(self):
+        self.assertEqual(self._suffix("1"), "; Secure")
+        self.assertEqual(self._suffix("1", "http"), "; Secure")
+
+    def test_disabled_secure(self):
+        self.assertEqual(self._suffix("0", "https"), "")
+
+    def test_auto_secure_behind_tls_proxy(self):
+        self.assertEqual(self._suffix("auto", "https"), "; Secure")
+        self.assertEqual(self._suffix("auto", "http"), "")
+        self.assertEqual(self._suffix("auto"), "")
 
 
 if __name__ == "__main__":

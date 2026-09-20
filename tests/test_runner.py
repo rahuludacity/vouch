@@ -12,6 +12,7 @@ import socket
 import sys
 import threading
 import unittest
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -45,10 +46,19 @@ def dep(**kw):
     return d
 
 
+# H-1: every container spec carries the deployment's gatekeeper credential.
+_TEST_DEP_TOKEN = "vouch_dep_dep_ab12cd34_acme_1700000000_" + "ab" * 16
+
+
+def makespec(**kw):
+    """build_container_spec with the mandatory H-1 deployment token."""
+    return build_container_spec(dep(), deployment_token=_TEST_DEP_TOKEN, **kw)
+
+
 # ------------------------------------------------------------------ sandbox
 class TestSandboxSpec(unittest.TestCase):
     def test_spec_encodes_sandbox_contract(self):
-        spec = build_container_spec(dep())
+        spec = makespec()
         # no host networking, ever: dedicated internal network only
         self.assertEqual(spec["network"], SANDBOX_NETWORK)
         self.assertNotEqual(spec.get("network_mode"), "host")
@@ -60,9 +70,10 @@ class TestSandboxSpec(unittest.TestCase):
         # resource limits
         self.assertTrue(spec["mem_limit"])
         self.assertTrue(spec["nano_cpus"])
-        # no privileged, all caps dropped
+        # no privileged, all caps dropped, non-root user
         self.assertFalse(spec["privileged"])
         self.assertIn("ALL", spec["cap_drop"])
+        self.assertEqual(spec["user"], "65534:65534")
         # identity env injection (§4.9)
         env = spec["environment"]
         self.assertEqual(env["VOUCH_TENANT_ID"], "acme")
@@ -80,46 +91,56 @@ class TestSandboxSpec(unittest.TestCase):
             bad = dep()
             bad[key] = ""
             with self.assertRaises(ValueError):
-                build_container_spec(bad)
+                build_container_spec(bad, deployment_token=_TEST_DEP_TOKEN)
 
     def test_validate_rejects_host_network(self):
-        spec = build_container_spec(dep())
+        spec = makespec()
         spec["network"] = "host"
         with self.assertRaises(ValueError):
             validate_spec(spec)
-        spec = build_container_spec(dep())
+        spec = makespec()
         spec["network_mode"] = "host"
         with self.assertRaises(ValueError):
             validate_spec(spec)
 
     def test_validate_rejects_wrong_network(self):
-        spec = build_container_spec(dep())
+        spec = makespec()
         spec["network"] = "bridge"
         with self.assertRaises(ValueError):
             validate_spec(spec)
 
     def test_validate_rejects_privileged_and_caps(self):
-        spec = build_container_spec(dep())
+        spec = makespec()
         spec["privileged"] = True
         with self.assertRaises(ValueError):
             validate_spec(spec)
-        spec = build_container_spec(dep())
+        spec = makespec()
         spec["cap_drop"] = []
         with self.assertRaises(ValueError):
             validate_spec(spec)
 
+    def test_validate_rejects_root_user(self):
+        for bad_user in (None, "", "0", "0:0", "root", "root:root"):
+            spec = makespec()
+            spec["user"] = bad_user
+            with self.assertRaises(ValueError, msg=f"user={bad_user!r}"):
+                validate_spec(spec)
+        spec = makespec()
+        spec["user"] = "65534:65534"
+        self.assertTrue(validate_spec(spec))
+
     def test_validate_rejects_writable_root_and_missing_limits(self):
-        spec = build_container_spec(dep())
+        spec = makespec()
         spec["read_only"] = False
         with self.assertRaises(ValueError):
             validate_spec(spec)
-        spec = build_container_spec(dep())
+        spec = makespec()
         del spec["mem_limit"]
         with self.assertRaises(ValueError):
             validate_spec(spec)
 
     def test_validate_rejects_missing_identity_env(self):
-        spec = build_container_spec(dep())
+        spec = makespec()
         del spec["environment"]["VOUCH_TASK_ID"]
         with self.assertRaises(ValueError):
             validate_spec(spec)
@@ -133,6 +154,7 @@ class TestSandboxSpec(unittest.TestCase):
 
         class FakeNet:
             name = SANDBOX_NETWORK
+            attrs = {"Internal": True}
 
         class FakeNetworks:
             def list(self, names=None):
@@ -159,6 +181,35 @@ class TestSandboxSpec(unittest.TestCase):
         self.assertEqual(ensure_sandbox_network(FakeClient2()), SANDBOX_NETWORK)
         self.assertEqual(created, [], "existing network must not be recreated")
 
+    def test_ensure_sandbox_network_rejects_non_internal(self):
+        # L-5: a pre-existing vouch-sandbox WITHOUT internal=true is a
+        # poisoned network — fail closed instead of granting egress.
+        class PoisonedNet:
+            name = SANDBOX_NETWORK
+            attrs = {"Internal": False}
+
+        class FakeNetworks:
+            def list(self, names=None):
+                return [PoisonedNet()]
+
+        class FakeClient:
+            networks = FakeNetworks()
+
+        with self.assertRaises(RuntimeError):
+            ensure_sandbox_network(FakeClient())
+
+    def test_spec_requires_deployment_token(self):
+        # H-1: a container spec without its gatekeeper credential is
+        # rejected — agents must never start unauthenticated.
+        with self.assertRaises(ValueError):
+            build_container_spec(dep())
+        s = makespec()
+        self.assertEqual(s["environment"]["VOUCH_DEPLOYMENT_TOKEN"],
+                         _TEST_DEP_TOKEN)
+        # L-5 hardening is part of the validated contract.
+        self.assertIn("no-new-privileges:true", s["security_opt"])
+        self.assertIn("noexec", s["tmpfs"]["/scratch"])
+
 
 # ------------------------------------------------------------------ runner
 class StubCP:
@@ -177,6 +228,10 @@ class StubCP:
     def report_status(self, dep_id, status, container_id=None):
         self.reports.append((dep_id, status, container_id))
         return True
+
+    def get_deployment_credential(self, dep_id):
+        # H-1: the runner fetches each deployment's gatekeeper credential.
+        return _TEST_DEP_TOKEN
 
 
 def desired_running(**kw):
@@ -206,6 +261,9 @@ class TestRunnerReconcile(unittest.TestCase):
         self.assertEqual(len(docker.started_specs), 1)
         spec = docker.started_specs[0]
         self.assertEqual(spec["network"], SANDBOX_NETWORK)  # spec validated
+        # H-1: the runner injected the deployment's gatekeeper credential.
+        self.assertEqual(spec["environment"]["VOUCH_DEPLOYMENT_TOKEN"],
+                         _TEST_DEP_TOKEN)
         cid = docker.containers["dep_ab12cd34"]["id"]
         self.assertIn(("dep_ab12cd34", "running", cid), cp.reports)
 
@@ -365,6 +423,30 @@ class TestControlPlaneClient(unittest.TestCase):
 
 
 # ------------------------------------------------------------- runner HTTP
+def _raw_oversized_status(base_url, path, headers=None):
+    """Declare ``Content-Length: 1000001`` but send only a partial body;
+    return the response status. urllib's full-body send races the server's
+    early 413 and flakes with BrokenPipeError; the raw socket proves the
+    server decides on the headers alone, before touching the body."""
+    u = urllib.parse.urlparse(base_url)
+    s = socket.create_connection((u.hostname, u.port or 80), timeout=15)
+    try:
+        lines = ["POST %s HTTP/1.1" % path, "Host: %s" % u.hostname,
+                 "Content-Length: 1000001", "Connection: close"]
+        for k, v in (headers or {}).items():
+            lines.append("%s: %s" % (k, v))
+        s.sendall(("\r\n".join(lines) + "\r\n\r\n").encode() + b"x" * 1024)
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        return int(resp.split(b" ", 2)[1])
+    finally:
+        s.close()
+
+
 class TestRunnerHttp(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -417,6 +499,13 @@ class TestRunnerHttp(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=10) as r:
             body = json.loads(r.read())
         self.assertIn("dep_ab12cd34", body["started"])
+
+    def test_reconcile_oversized_body_rejected(self):
+        # M-2: >1MB reconcile bodies are refused before any more work.
+        code = _raw_oversized_status(
+            self.base, "/v1/reconcile",
+            {"Authorization": "Bearer rtok"})
+        self.assertEqual(code, 413)
 
 
 if __name__ == "__main__":

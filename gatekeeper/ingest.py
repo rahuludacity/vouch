@@ -20,6 +20,12 @@ Semantics:
   - While a flush is in flight for a tenant, new emits spool instead of
     fast-pathing, so the flusher's batch and a live emit can never assign
     the same seq.
+  - Locking is PER TENANT. The seq reservation (build -> ingest -> commit)
+    holds the tenant's lock across the HTTP call — this is what keeps two
+    threads from assigning the same seq — but a slow/hung receipt service
+    stalls only that tenant's gatekeeper threads, never the whole server.
+    Lock ordering is meta-lock -> one tenant lock, never nested the other
+    way, so there is no deadlock. The 5s HTTP timeout bounds the stall.
   - The local v1 file is the durable spool of record; the in-memory queue
     holds the service-bound fields and is rebuilt off the service tip at
     flush time, so a restart re-syncs instead of guessing seqs.
@@ -57,8 +63,12 @@ class ReceiptEmitter:
         self.svc_url = (svc_url or "").rstrip("/")
         self.svc_token = svc_token
         self.flush_interval = flush_interval
-        self._lock = threading.Lock()
+        # Per-tenant locks (see module docstring): a hung receipt service
+        # must stall only the affected tenant, never the whole gatekeeper.
+        self._meta = threading.Lock()   # guards self._locks only
+        self._locks = {}                # tenant_id -> threading.Lock
         # tenant_id -> {"next_seq": int, "tip": str|None}; None tip = unknown
+        # (per-tenant content guarded by that tenant's lock)
         self._state = {}
         # tenant_id -> deque of field-dicts awaiting ingest (seq assigned at flush)
         self._spool = {}
@@ -71,6 +81,15 @@ class ReceiptEmitter:
             target=self._flush_loop, name="receipt-flusher", daemon=True
         )
         self._flusher.start()
+
+    def _tlock(self, tenant_id):
+        """Return the lock for one tenant (created on first use)."""
+        with self._meta:
+            lock = self._locks.get(tenant_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[tenant_id] = lock
+            return lock
 
     # ------------------------------------------------------------------ api
     def emit(self, *, tenant_id, task_id, agent_id, tool, args, decision,
@@ -86,7 +105,9 @@ class ReceiptEmitter:
             tool=tool, args=args, decision=decision, reason=reason,
             rule_id=rule_id, policy_version=policy_version,
         )
-        with self._lock:
+        # Per-tenant lock: the seq reservation below spans the HTTP
+        # call, so a hung receipt service stalls only this tenant.
+        with self._tlock(tenant_id):
             if (self.svc_url and not self._spool.get(tenant_id)
                     and tenant_id not in self._flushing):
                 receipt = self._build(fields)
@@ -114,10 +135,12 @@ class ReceiptEmitter:
 
     def spooled(self, tenant_id=None):
         """How many receipts are waiting for flush (test/debug hook)."""
-        with self._lock:
-            if tenant_id is not None:
+        if tenant_id is not None:
+            with self._tlock(tenant_id):
                 return len(self._spool.get(tenant_id, ()))
-            return sum(len(q) for q in self._spool.values())
+        with self._meta:
+            tenants = list(self._locks)
+        return sum(self.spooled(t) for t in tenants)
 
     def flush_now(self):
         """Run one flush pass synchronously (tests)."""
@@ -240,8 +263,8 @@ class ReceiptEmitter:
                 pass
 
     def _flush_pass(self):
-        with self._lock:
-            tenants = [t for t, q in self._spool.items() if q]
+        with self._meta:
+            tenants = list(self._locks)
         for tenant_id in tenants:
             self._flush_tenant(tenant_id)
 
@@ -252,7 +275,8 @@ class ReceiptEmitter:
         # flag keeps live emit()s on the spool path while this batch is in
         # flight, so the flusher and a fast-path emit can never build two
         # receipts off the same tip state.
-        with self._lock:
+        tlock = self._tlock(tenant_id)
+        with tlock:
             queue = self._spool.get(tenant_id)
             if not queue or tenant_id in self._flushing:
                 return
@@ -264,22 +288,22 @@ class ReceiptEmitter:
         failed_at = None
         try:
             for i, fields in enumerate(batch):
-                with self._lock:
+                with tlock:
                     receipt = self._build(fields)
                 outcome = self._try_ingest(receipt)
                 if outcome == "ok":
-                    with self._lock:
+                    with tlock:
                         self._commit(receipt)
                     continue
                 if outcome == "duplicate" and \
                         self._resolve_duplicate(receipt):
-                    with self._lock:
+                    with tlock:
                         self._commit(receipt)
                     continue
                 failed_at = i
                 break
         finally:
-            with self._lock:
+            with tlock:
                 self._flushing.discard(tenant_id)
                 if failed_at is not None:
                     # failure, chain_break, or a lost duplicate race: put

@@ -236,14 +236,18 @@ class Handler(BaseHTTPRequestHandler):
                              {"status": status})
 
     def _cp_tenant_status(self, tenant_id):
-        """Current tenant status from the control plane's §4.3 key bundle.
+        """Current tenant status from the control plane (§4.3).
+
+        Uses the tenant:admin-scoped status endpoint — billing must never
+        receive key material (M-1), so the keys:read key bundle is off
+        limits; status alone is enough for the over-quota sweep.
 
         Returns the status string, or None when it can't be read (treated
         like unavailable usage: skip, never act).
         """
         try:
             req = urllib.request.Request(
-                f"{CONTROLPLANE_URL}/internal/tenants/{tenant_id}/key-bundle",
+                f"{CONTROLPLANE_URL}/internal/tenants/{tenant_id}/status",
                 headers={"Authorization": f"Bearer {BILLING_SVC_TOKEN}"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return json.loads(resp.read().decode("utf-8")).get("status")

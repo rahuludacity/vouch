@@ -81,6 +81,11 @@ RECEIPT_SVC_URL = os.environ.get("RECEIPT_SVC_URL",
 OPERATOR_KEY = os.environ.get("DASHBOARD_API_KEY", "")
 SESSION_TTL = int(os.environ.get("DASHBOARD_SESSION_TTL", "43200"))
 SESSION_COOKIE = "vouch_dash_session"
+# Secure-cookie policy: "1" forces the Secure attribute, "0" disables it,
+# "auto" (default) adds Secure only when the request arrives over TLS
+# (X-Forwarded-Proto: https behind a reverse proxy). Set to "1" whenever
+# the dashboard is served over HTTPS.
+SECURE_COOKIE = os.environ.get("VOUCH_SECURE_COOKIE", "auto")
 
 _sessions = {}          # session_id -> {"api_key": str, "csrf": str, "exp": float}
 _sessions_lock = threading.Lock()
@@ -111,6 +116,26 @@ def _get_session(sid):
 def _drop_session(sid):
     with _sessions_lock:
         _sessions.pop(sid, None)
+
+
+def _sweep_expired_sessions():
+    """Remove expired sessions so abandoned logins never accumulate."""
+    now = time.time()
+    with _sessions_lock:
+        dead = [sid for sid, s in _sessions.items() if s["exp"] < now]
+        for sid in dead:
+            del _sessions[sid]
+    return len(dead)
+
+
+def _session_sweeper(interval=600.0):
+    """Background sweep for expired dashboard sessions (L-2)."""
+    while True:
+        time.sleep(interval)
+        try:
+            _sweep_expired_sessions()
+        except Exception:
+            pass
 
 
 def esc(v):
@@ -153,19 +178,33 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         return u.path, {k: v[0] for k, v in parse_qs(u.query).items()}
 
+    # M-2: single cap helper — every caller gets 400/413 before allocating.
+    def _read_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            return "BAD_LENGTH"
+        if length > 1_000_000:
+            return "TOO_LARGE"
+        return self.rfile.read(length) if length else b""
+
     def _read_json(self):
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        if not length:
+        raw = self._read_body()
+        if raw in ("BAD_LENGTH", "TOO_LARGE"):
+            return raw
+        if not raw:
             return {}
         try:
-            body = json.loads(self.rfile.read(length))
+            body = json.loads(raw)
         except (ValueError, UnicodeDecodeError):
             return "INVALID"
         return body if isinstance(body, dict) else "INVALID"
 
     def _read_form(self):
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+        raw = self._read_body()
+        if raw in ("BAD_LENGTH", "TOO_LARGE"):
+            return raw
+        raw = raw.decode("utf-8", "replace") if raw else ""
         return {k: v[0] for k, v in parse_qs(raw).items()}
 
     def log_message(self, *a):  # quieter logs
@@ -228,17 +267,39 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     # ------------------------------------------------------------- chrome
-    def _nav(self, active):
+    def _secure_cookie_suffix(self):
+        # TLS-controlled Secure flag: force with VOUCH_SECURE_COOKIE=1, or
+        # auto-add when the request arrived over TLS (behind a proxy).
+        if SECURE_COOKIE == "1":
+            return "; Secure"
+        if SECURE_COOKIE == "auto" and \
+                self.headers.get("X-Forwarded-Proto", "") == "https":
+            return "; Secure"
+        return ""
+
+    def _nav(self, active, csrf=""):
         items = [("overview", "Overview"), ("receipts", "Receipts"),
                  ("policies", "Policies"), ("deployments", "Deployments"),
                  ("keys", "API Keys")]
         links = " ".join(
             f'<a href="/{p}" class="{ "on" if p == active else ""}">{t}</a>'
             for p, t in items)
+        # L-2: logout is a state-changing POST — carry the CSRF token so a
+        # cross-site form cannot log the operator out (logout CSRF).
+        csrf_field = (f'<input type="hidden" name="csrf_token" value="{csrf}">'
+                      if csrf else "")
         return (f'<nav>{links}'
                 f'<form method="post" action="/logout" style="display:inline">'
+                f'{csrf_field}'
                 f'<button type="submit" class="linklike">log out</button>'
                 f"</form></nav>")
+
+    def _page_csrf(self):
+        """CSRF token for forms rendered in the page chrome (L-2 logout)."""
+        if OPERATOR_KEY:
+            return ""
+        s = _get_session(self._cookie_sid())
+        return s["csrf"] if s else ""
 
     def _page(self, title, active, inner):
         return f"""<!doctype html><html><head><meta charset="utf-8">
@@ -270,7 +331,7 @@ font-size:13px}}
 .banner{{border:1px solid;border-radius:8px;padding:10px 14px;margin:12px 0}}
 </style></head><body>
 <h1>Vouch <span class="muted">governed agent deployment, with proof</span></h1>
-{self._nav(active) if active else ""}
+{self._nav(active, csrf=self._page_csrf()) if active else ""}
 {inner}
 </body></html>"""
 
@@ -316,6 +377,11 @@ page.</p>
         ctype = self.headers.get("Content-Type", "")
         form = self._read_form() if "urlencoded" in ctype else {}
         body = self._read_json() if not form else {}
+        if "TOO_LARGE" in (form, body):
+            return self._err(413, "payload_too_large",
+                             "request body exceeds 1MB")
+        if form == "BAD_LENGTH" or body == "BAD_LENGTH":
+            return self._err(400, "bad_request", "bad Content-Length")
         key = (form.get("api_key") or body.get("api_key") or "").strip()
         if not key.startswith("vouch_sk_"):
             return self._send_html(200, self._login_page(
@@ -326,7 +392,8 @@ page.</p>
                 "Key rejected by the control plane (or it's unreachable)."))
         tenant_id, name = ident
         sid = _new_session(key)
-        cookie = (f"{SESSION_COOKIE}={sid}; HttpOnly; SameSite=Lax; "
+        secure = self._secure_cookie_suffix()
+        cookie = (f"{SESSION_COOKIE}={sid}; HttpOnly; SameSite=Lax;{secure} "
                   f"Path=/; Max-Age={SESSION_TTL}")
         if "application/json" in ctype:
             s = _get_session(sid)
@@ -341,9 +408,25 @@ page.</p>
         self._redirect("/overview", cookie=cookie)
 
     def _do_logout(self):
+        # L-2: logout is state-changing — require the CSRF token so a
+        # cross-site POST cannot log the operator out from under them.
+        # M-2: an oversized body is rejected (413) BEFORE any session
+        # handling — the TOO_LARGE sentinel must not fall through the
+        # isinstance(form, dict) check and skip CSRF validation.
         if not OPERATOR_KEY:
+            form = self._read_form()
+            if form == "TOO_LARGE":
+                return self._err(413, "payload_too_large",
+                                 "request body exceeds 1MB")
+            if form == "BAD_LENGTH":
+                return self._err(400, "bad_content_length",
+                                 "invalid Content-Length")
+            if isinstance(form, dict) and not self._csrf_form_ok(form):
+                return self._send_html(403, self._page(
+                    "Forbidden", None, "<p>Bad CSRF token.</p>"))
             _drop_session(self._cookie_sid())
-        expired = f"{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"
+        expired = (f"{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; "
+                   "Path=/; Max-Age=0")
         self._redirect("/login", cookie=expired)
 
     # -------------------------------------------------------------- overview
@@ -832,7 +915,10 @@ leaves the server (§10.5).</p></div>"""
                 task = quote(parts[1], safe="")
                 if method == "PUT":
                     body = self._read_json()
-                    if body == "INVALID" or not isinstance(
+                    if body == "TOO_LARGE":
+                        return self._err(413, "payload_too_large",
+                                         "request body exceeds 1MB")
+                    if body in ("INVALID", "BAD_LENGTH") or not isinstance(
                             body.get("rules"), dict):
                         return self._err(400, "bad_request",
                                          "body.rules must be an object")
@@ -845,7 +931,10 @@ leaves the server (§10.5).</p></div>"""
                 return relay(CONTROLPLANE_URL, "/v1/deployments")
             if len(parts) == 1 and method == "POST":
                 body = self._read_json()
-                if body == "INVALID":
+                if body == "TOO_LARGE":
+                    return self._err(413, "payload_too_large",
+                                     "request body exceeds 1MB")
+                if body in ("INVALID", "BAD_LENGTH"):
                     return self._err(400, "bad_request", "invalid JSON")
                 return relay(CONTROLPLANE_URL, "/v1/deployments",
                              body={"task_id": body.get("task_id"),
@@ -859,7 +948,10 @@ leaves the server (§10.5).</p></div>"""
                 return relay(CONTROLPLANE_URL, "/v1/api-keys")
             if len(parts) == 1 and method == "POST":
                 body = self._read_json()
-                if body == "INVALID":
+                if body == "TOO_LARGE":
+                    return self._err(413, "payload_too_large",
+                                     "request body exceeds 1MB")
+                if body in ("INVALID", "BAD_LENGTH"):
                     return self._err(400, "bad_request", "invalid JSON")
                 return relay(CONTROLPLANE_URL, "/v1/api-keys",
                              body={"name": body.get("name", "unnamed")},
@@ -964,6 +1056,11 @@ leaves the server (§10.5).</p></div>"""
             return self._api("POST", path, q, key)
         # HTML form posts
         form = self._read_form()
+        if form == "TOO_LARGE":
+            return self._err(413, "payload_too_large",
+                             "request body exceeds 1MB")
+        if form == "BAD_LENGTH":
+            return self._err(400, "bad_request", "bad Content-Length")
         if path.startswith("/policies/") and path.endswith("/delete"):
             task = path[len("/policies/"):-len("/delete")]
             if not self._csrf_form_ok(form):
@@ -1032,8 +1129,13 @@ leaves the server (§10.5).</p></div>"""
 
 
 def main():
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"vouch dashboard on :{PORT} "
+    import os as _os
+    bind = _os.environ.get("VOUCH_BIND", "127.0.0.1")
+    # L-2: expired sessions are lazily evicted on access; the sweeper makes
+    # sure abandoned logins never accumulate in memory.
+    threading.Thread(target=_session_sweeper, daemon=True).start()
+    server = ThreadingHTTPServer((bind, PORT), Handler)
+    print(f"vouch dashboard on {bind}:{PORT} "
           f"(control plane {CONTROLPLANE_URL}, receipts {RECEIPT_SVC_URL})",
           flush=True)
     server.serve_forever()

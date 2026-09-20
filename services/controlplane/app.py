@@ -21,19 +21,44 @@ Endpoints:
     GET  /v1/deployments                  tenant key
     GET  /v1/deployments/{id}            tenant key
     DELETE /v1/deployments/{id}          tenant key  (-> stopped)
-    GET  /internal/tenants/{id}/key-bundle  service token  (§4.3)
-    GET  /internal/tenants/{id}/keys        service token  (§4.7)
-    GET  /internal/policies/bundle?tenant_id=&since_version=  service token (§4.4)
-    POST /internal/cache/invalidate      service token  (§4.3, best-effort push)
-    GET  /internal/desired-state         service token  (§4.5)
-    POST /internal/deployments/{id}/status  service token (§4.5)
-    POST /internal/tenants/{id}/plan     service token  (§4.8 billing hook)
-    POST /internal/tenants/{id}/status   service token  (suspension wiring)
+    GET  /internal/tenants/{id}/key-bundle  service token, scope keys:read (§4.3)
+    GET  /internal/tenants/{id}/keys        service token, scope keys:read (§4.7)
+    GET  /internal/tenants/{id}/status      service token, scope tenant:admin
+                                           (status only, no key material)
+    GET  /internal/policies/bundle?tenant_id=&since_version=  service token,
+                                           scope policies:read (§4.4)
+    POST /internal/cache/invalidate      service token, scope cache:invalidate
+                                           (§4.3, best-effort push)
+    GET  /internal/desired-state         service token, scope deployments:read
+                                           (§4.5)
+    POST /internal/deployments/{id}/status  service token, scope
+                                           deployments:status (§4.5)
+    GET  /internal/deployments/{id}      service token, scope deployment:verify
+                                           or deployments:read (H-1 binding
+                                           check: tenant_id + status)
+    GET  /internal/deployments/{id}/credential  service token, scope
+                                           deployments:read (H-1: runner
+                                           fetches the deployment's gatekeeper
+                                           credential for container injection)
+    GET  /internal/platform/deployment-token-key  service token, scope
+                                           deployment:verify (H-1: the HMAC key
+                                           the gatekeeper verifies deployment
+                                           tokens with; gatekeeper only)
+    POST /internal/tenants/{id}/plan     service token, scope tenant:admin
+                                           (§4.8 billing hook)
+    POST /internal/tenants/{id}/status   service token, scope tenant:admin
+                                           (suspension wiring)
+
+Service-token scopes (Phase 7, M-1): a valid token outside the endpoint's
+scope gets 403. Raw tenant HMAC key material is only ever served to the
+keys:read scope (gatekeeper + receipt service).
 
 Errors: {"error": "<code>", "message": "<human>"} with HTTP status (§4).
 
 Run:  python3 -m services.controlplane.app
-Env:  CONTROLPLANE_PORT    (default 9002)
+Env:  VOUCH_BIND         bind address (default 127.0.0.1; set 0.0.0.0 when
+                         running without network_mode: host, see compose)
+      CONTROLPLANE_PORT    (default 9002)
       CONTROLPLANE_DB      (default <repo>/data/controlplane.db)
       GATEKEEPER_URL       gatekeeper base for push-invalidate (default "";
                            empty disables the push — the 60s TTL is the backstop)
@@ -54,6 +79,7 @@ from urllib.parse import urlparse, parse_qs
 from .models import ControlPlaneDB, PLANS, STATUSES
 
 HERE = os.path.dirname(__file__)
+BIND = os.environ.get("VOUCH_BIND", "127.0.0.1")
 PORT = int(os.environ.get("CONTROLPLANE_PORT", "9002"))
 DB_PATH = os.environ.get(
     "CONTROLPLANE_DB", os.path.join(HERE, "..", "..", "data", "controlplane.db"))
@@ -91,8 +117,18 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         return u.path, {k: v[0] for k, v in parse_qs(u.query).items()}
 
+    # Cap request bodies at 1MB (M-2 fix): an unbounded rfile.read() from a
+    # client-controlled Content-Length is a trivial memory-exhaustion vector
+    # against ThreadingHTTPServer's unbounded thread pool.
+    _MAX_BODY = 1_000_000
+
     def _read_json(self):
-        length = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            return "INVALID"
+        if length > self._MAX_BODY:
+            return "TOO_LARGE"
         if not length:
             return {}
         try:
@@ -100,6 +136,11 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return "INVALID"
         return body if isinstance(body, dict) else "INVALID"
+
+    def _too_large(self):
+        self._err(413, "payload_too_large",
+                  f"request body exceeds {self._MAX_BODY} bytes")
+        return "TOO_LARGE"
 
     def _bearer(self):
         auth = self.headers.get("Authorization", "")
@@ -110,7 +151,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.db.get_tenant_by_api_key(self._bearer())
 
     def _service(self):
-        """Service-token name for a service bearer, or None."""
+        """(token name, scopes) for a service bearer, or (None, frozenset())."""
         return self.db.validate_service_token(self._bearer())
 
     def _require_tenant(self):
@@ -120,27 +161,42 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return t
 
-    def _require_service(self):
-        name = self._service()
+    def _require_service(self, *scopes):
+        """Service-token auth WITH scope enforcement (M-1 fix).
+
+        Invalid token -> 401. Valid token outside the endpoint's scope ->
+        403: a leaked runner token can no longer dump tenant HMAC key
+        material, and a billing token cannot touch key/policy bundles.
+        Returns the token name on success.
+        """
+        name, have = self._service()
         if name is None:
             self._err(401, "unauthorized", "valid service token required")
+            return None
+        if scopes and not (set(scopes) & set(have)):
+            self._err(403, "forbidden",
+                      f"service token '{name}' lacks required scope "
+                      f"({', '.join(scopes)})")
             return None
         return name
 
     @classmethod
-    def _push_invalidate(cls, tenant_id):
-        """Best-effort: tell the gatekeeper to drop a cached key bundle.
+    def _push_invalidate(cls, tenant_id, deployment_id=None):
+        """Best-effort: tell the gatekeeper to drop cached key/deployment data.
 
-        Never raises; the gatekeeper's 60s TTL is the backstop. Wire it by
+        Never raises; the gatekeeper's TTLs are the backstop. Wire it by
         setting GATEKEEPER_URL and CONTROLPLANE_INVALIDATE_TOKEN (to the
         same value as the gatekeeper's GATEKEEPER_SVC_TOKEN).
         """
         if not GATEKEEPER_URL or not INVALIDATE_TOKEN:
             return
+        body = {"tenant_id": tenant_id}
+        if deployment_id:
+            body["deployment_id"] = deployment_id
         try:
             req = urllib.request.Request(
                 GATEKEEPER_URL + "/internal/cache/invalidate",
-                data=json.dumps({"tenant_id": tenant_id}).encode("utf-8"),
+                data=json.dumps(body).encode("utf-8"),
                 headers={"Content-Type": "application/json",
                          "Authorization": f"Bearer {INVALIDATE_TOKEN}"},
                 method="POST",
@@ -193,6 +249,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._internal_bundle(q)
         if path == "/internal/desired-state":
             return self._internal_desired_state()
+        if path == "/internal/platform/deployment-token-key":
+            return self._internal_platform_key()
+        if path.startswith("/internal/deployments/"):
+            return self._internal_deployment_get(path)
         return self._err(404, "not_found")
 
     def _get_me(self):
@@ -235,10 +295,23 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, dep)
 
     def _internal_tenant_get(self, path):
-        if self._require_service() is None:
-            return
-        rest = path[len("/internal/tenants/"):]  # {id}/key-bundle | {id}/keys
+        rest = path[len("/internal/tenants/"):]
         tenant_id, _, tail = rest.partition("/")
+        if tail == "status":
+            # M-1: tenant status without key material — tenant:admin scope
+            # (billing's over-quota sweep needs status; it must NOT get the
+            # keys:read key bundle).
+            if self._require_service("tenant:admin") is None:
+                return
+            t = self.db.get_tenant(tenant_id)
+            if t is None:
+                return self._err(404, "unknown_tenant")
+            return self._send(200, {"tenant_id": tenant_id,
+                                   "status": t["status"]})
+        # M-1: raw tenant key material is keys:read only (gatekeeper +
+        # receipt service). Runner/billing tokens get 403 here.
+        if self._require_service("keys:read") is None:
+            return
         if tail == "key-bundle":
             bundle = self.db.key_bundle(tenant_id)
             if bundle is None:
@@ -252,7 +325,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._err(404, "not_found")
 
     def _internal_bundle(self, q):
-        if self._require_service() is None:
+        if self._require_service("policies:read") is None:
             return
         tenant_id = q.get("tenant_id", "")
         if not tenant_id:
@@ -268,9 +341,56 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"version": version, "policies": policies})
 
     def _internal_desired_state(self):
-        if self._require_service() is None:
+        if self._require_service("deployments:read") is None:
             return
         self._send(200, {"deployments": self.db.desired_state()})
+
+    def _internal_platform_key(self):
+        """Platform deployment-token signing key (H-1).
+
+        M-1: deployment:verify scope only (the gatekeeper). A leaked
+        receipt-service or runner token cannot mint deployment credentials.
+        """
+        if self._require_service("deployment:verify") is None:
+            return
+        self._send(200, {"key_hex": self.db.get_deployment_signing_key()})
+
+    def _internal_deployment_get(self, path):
+        """GET /internal/deployments/{id} and /internal/deployments/{id}/credential.
+
+        {id}: (deployment_id, tenant_id, task_id, status) — the gatekeeper's
+        revocation-aware binding check (deployment:verify) and the runner
+        (deployments:read) share it; either scope suffices.
+        {id}/credential: the deployment's gatekeeper bearer credential
+        (runner only — deployments:read). Never exposed to tenants.
+        """
+        rest = path[len("/internal/deployments/"):]
+        dep_id, _, tail = rest.partition("/")
+        if tail == "credential":
+            if self._require_service("deployments:read") is None:
+                return
+            dep = self.db.get_deployment_any(dep_id)
+            if dep is None:
+                return self._err(404, "not_found", "deployment not found")
+            token = self.db.get_deployment_token(dep_id)
+            if token is None:
+                return self._err(410, "credential_revoked",
+                                 "deployment credential revoked")
+            return self._send(200, {"deployment_id": dep_id,
+                                    "tenant_id": dep["tenant_id"],
+                                    "deployment_token": token})
+        if tail:
+            return self._err(404, "not_found")
+        if self._require_service("deployment:verify",
+                                 "deployments:read") is None:
+            return
+        dep = self.db.get_deployment_any(dep_id)
+        if dep is None:
+            return self._err(404, "not_found", "deployment not found")
+        self._send(200, {"deployment_id": dep["id"],
+                         "tenant_id": dep["tenant_id"],
+                         "task_id": dep["task_id"],
+                         "status": dep["status"]})
 
     # ---------------------------------------------------------------- POST
     def do_POST(self):
@@ -295,6 +415,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body == "INVALID":
             return self._err(400, "bad_request", "body must be a JSON object")
+        if body == "TOO_LARGE":
+            return self._too_large()
         try:
             result = self.db.create_tenant(body.get("name", ""))
         except ValueError as e:
@@ -318,6 +440,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body == "INVALID":
             return self._err(400, "bad_request", "body must be a JSON object")
+        if body == "TOO_LARGE":
+            return self._too_large()
         try:
             result = self.db.create_api_key(t["id"], body.get("name", ""))
         except (ValueError, KeyError) as e:
@@ -331,6 +455,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body == "INVALID":
             return self._err(400, "bad_request", "body must be a JSON object")
+        if body == "TOO_LARGE":
+            return self._too_large()
         try:
             result = self.db.create_deployment(
                 t["id"], body.get("task_id", ""), body.get("agent_image", ""))
@@ -339,11 +465,13 @@ class Handler(BaseHTTPRequestHandler):
         self._send(201, result)
 
     def _internal_invalidate(self):
-        if self._require_service() is None:
+        if self._require_service("cache:invalidate") is None:
             return
         body = self._read_json()
         if body == "INVALID":
             return self._err(400, "bad_request", "body must be a JSON object")
+        if body == "TOO_LARGE":
+            return self._too_large()
         tenant_id = body.get("tenant_id", "")
         if not tenant_id:
             return self._err(400, "bad_request", "tenant_id required")
@@ -351,7 +479,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True, "tenant_id": tenant_id})
 
     def _internal_deployment_status(self, path):
-        if self._require_service() is None:
+        if self._require_service("deployments:status") is None:
             return
         # /internal/deployments/{id}/status
         rest = path[len("/internal/deployments/"):]
@@ -361,6 +489,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body == "INVALID":
             return self._err(400, "bad_request", "body must be a JSON object")
+        if body == "TOO_LARGE":
+            return self._too_large()
         try:
             ok = self.db.set_deployment_status(
                 dep_id, body.get("status", ""),
@@ -372,7 +502,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True})
 
     def _internal_tenant_post(self, path):
-        if self._require_service() is None:
+        if self._require_service("tenant:admin") is None:
             return
         # /internal/tenants/{id}/plan | /internal/tenants/{id}/status
         rest = path[len("/internal/tenants/"):]
@@ -380,6 +510,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body == "INVALID":
             return self._err(400, "bad_request", "body must be a JSON object")
+        if body == "TOO_LARGE":
+            return self._too_large()
         if tail == "plan":
             try:
                 ok = self.db.set_plan(tenant_id, body.get("plan", ""))
@@ -414,6 +546,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body == "INVALID":
             return self._err(400, "bad_request", "body must be a JSON object")
+        if body == "TOO_LARGE":
+            return self._too_large()
         try:
             version = self.db.put_policy(
                 t["id"], task_id, body.get("rules"), updated_by=t["id"])
@@ -458,6 +592,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self.db.stop_deployment(t["id"], dep_id):
             return self._err(404, "not_found", "deployment not found")
+        # The deployment's gatekeeper credential was just revoked — push
+        # deployment-specific invalidation so the gatekeeper drops the cached
+        # binding now instead of at the 60s TTL.
+        self._push_invalidate(t["id"], dep_id)
         self._send(200, {"deployment_id": dep_id, "status": "stopped"})
 
 
@@ -469,7 +607,7 @@ def main():
         print(f"gatekeeper push-invalidate: {GATEKEEPER_URL}")
     else:
         print("gatekeeper push-invalidate: disabled (60s TTL is the backstop)")
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":

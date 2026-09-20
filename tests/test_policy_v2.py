@@ -275,11 +275,62 @@ class SchemaValidationTest(unittest.TestCase):
                 self._rule_with_regex(pat)
 
     def test_regex_allows_re2_subset(self):
-        for pat in (r"^[0-9a-f]{6,40}$", r"(?:a|b)+", r"(?P<word>\w+)",
+        for pat in (r"^[0-9a-f]{6,40}$", r"(?:ab)+", r"(?P<word>\w+)",
                     r"(?i)abc", r"(?i:abc)", r"\d+\.\d+", r"[(\[{]",
-                    r"\\", r"\(?:not-a-group\)"):
+                    r"\\", r"\(?:not-a-group\)", r"[ab]+", r"(\d+)-(\d+)"):
             rule = self._rule_with_regex(pat)  # must not raise
             self.assertEqual(rule.rule_id, "r")
+
+    def test_regex_rejects_catastrophic_shapes(self):
+        # M-3: nested quantifiers and quantified alternations are the
+        # classic catastrophic-backtracking shapes — rejected at load.
+        for pat in (r"(a+)+$", r"(a+)+", r"(a*)*", r"(x+)*", r"(a|aa)+$",
+                    r"(?:a|b)+", r"(a|b)*", r"(\w+)+", r"(a{2,3})+"):
+            with self.assertRaises(PolicyError, msg=pat):
+                self._rule_with_regex(pat)
+
+    def test_regex_catastrophic_rejected_fast(self):
+        # The review's example (a+)+$ is refused at load, not evaluated.
+        import time
+        t0 = time.time()
+        with self.assertRaises(PolicyError):
+            self._rule_with_regex(r"(a+)+$")
+        self.assertLess(time.time() - t0, 5.0)
+
+    def test_regex_timeout_fails_decision_closed(self):
+        # Defense in depth, proven against the real failure mode: a
+        # catastrophic match that slips past the load-time scanner must
+        # still be killed on time. CPython's re engine never releases
+        # the GIL during a match, so a thread-pool watchdog cannot bound
+        # it (measured: 59s elapsed vs the 0.25s budget); the match runs
+        # in a worker *process* the OS preempts, and the runaway is
+        # SIGTERMed. decide() then fails closed (deny).
+        import re as _re
+        import time as _t
+        import gatekeeper.policy_v2 as pv
+        evil = _re.compile(r"(a|a)*$")  # scanner would reject; the
+        # watchdog is the backstop for shapes it misses
+        t0 = _t.monotonic()
+        with self.assertRaises(pv.RegexTimeout):
+            pv._match_regex_guarded(evil, "a" * 28 + "b")
+        dt = _t.monotonic() - t0
+        self.assertLess(dt, 5.0, f"watchdog did not bound the match: {dt}s")
+        self.assertGreaterEqual(dt, 0.2, f"suspiciously fast: {dt}s")
+        # the pool heals itself: the next match spawns a fresh worker
+        self.assertTrue(pv._match_regex_guarded(
+            _re.compile(r"^b+$"), "bbb"))
+        # and a timed-out allow rule denies the whole decision
+        rule = self._rule_with_regex(r"a+$")
+        real_search = pv._regex_pool.search
+        pv._regex_pool.search = lambda *a, **k: (True, False)
+        try:
+            pol = pv.Policy({"t": {"version": 1, "allow": [rule], "deny": []}},
+                            version=1)
+            allowed, reason, _ = pol.decide("t", "x", {"a": "aaa"})
+            self.assertFalse(allowed)
+            self.assertIn("fail closed", reason)
+        finally:
+            pv._regex_pool.search = real_search
 
     def test_regex_escaped_backslash_digit_ok(self):
         # \\1 is an escaped backslash + "1", not a backreference

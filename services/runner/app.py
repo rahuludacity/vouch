@@ -34,6 +34,7 @@ Env:  RUNNER_PORT            (default 9003)
                              everything below the docker call is real.
 """
 import json
+import hmac
 import os
 import subprocess
 import sys
@@ -53,6 +54,7 @@ from .sandbox import (
 )
 
 HERE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+BIND = os.environ.get("VOUCH_BIND", "127.0.0.1")
 PORT = int(os.environ.get("RUNNER_PORT", "9003"))
 CONTROLPLANE_URL = os.environ.get("CONTROLPLANE_URL", "http://127.0.0.1:9002").rstrip("/")
 SVC_TOKEN = os.environ.get("RUNNER_TOKEN", "")
@@ -100,6 +102,24 @@ class ControlPlaneClient:
         if not isinstance(deployments, list):
             raise ControlPlaneError("desired-state missing deployments list")
         return deployments
+
+    def get_deployment_credential(self, dep_id):
+        """Fetch the deployment's gatekeeper credential (H-1).
+
+        The control plane mints one per deployment at creation; the runner
+        injects it into the agent container as VOUCH_DEPLOYMENT_TOKEN so the
+        agent can authenticate to the gatekeeper. Never logged, never
+        exposed beyond the container env.
+        """
+        body = self._request("GET", f"/internal/deployments/{dep_id}/credential")
+        token = body.get("deployment_token")
+        if not token:
+            raise ControlPlaneError(
+                f"no deployment credential for {dep_id}")
+        if body.get("tenant_id") is None:
+            raise ControlPlaneError(
+                f"credential response missing tenant for {dep_id}")
+        return token
 
     def report_status(self, dep_id, status, container_id=None):
         """POST the runner-observed status; True if the control plane took it."""
@@ -294,8 +314,13 @@ class Runner:
                 self._log(f"{dep_id}: previous container exited, replacing")
                 self._remove_container(dep_id, cur["id"])
             try:
+                # H-1: fetch the deployment's gatekeeper credential and inject
+                # it into the container env — this is the only way the agent
+                # can authenticate to the gatekeeper.
+                dep_token = self.cp.get_deployment_credential(dep_id)
                 spec = build_container_spec(
-                    dep, gatekeeper_url=self.gatekeeper_agent_url)
+                    dep, gatekeeper_url=self.gatekeeper_agent_url,
+                    deployment_token=dep_token)
                 cid = self.docker.start(spec)
             except Exception as e:
                 summary["failed"].append(dep_id)
@@ -350,8 +375,10 @@ class Handler(BaseHTTPRequestHandler):
     def _require_auth(self):
         if self.svc_token in (None, ""):
             return True  # no token configured: open (local dev only)
-        return (self.headers.get("Authorization", "") ==
-                f"Bearer {self.svc_token}")
+        # L-1: constant-time bearer comparison.
+        return hmac.compare_digest(
+            self.headers.get("Authorization", ""),
+            f"Bearer {self.svc_token}")
 
     def do_GET(self):
         if self.path != "/v1/health":
@@ -365,6 +392,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path != "/v1/reconcile":
             return self._send(404, {"error": "not_found"})
+        # M-2: 1MB body cap (this endpoint ignores the body, but a
+        # client-controlled Content-Length must not drive an unbounded read).
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            return self._send(400, {"error": "bad Content-Length"})
+        if length > 1_000_000:
+            return self._send(413, {"error": "payload_too_large"})
+        if length:
+            self.rfile.read(length)  # drain so the connection stays usable
         if not self._require_auth():
             return self._send(401, {"error": "unauthorized"})
         self._send(200, self.runner.reconcile_once())
@@ -422,7 +459,7 @@ def main(argv):
         print("WARNING: RUNNER_TOKEN not set; /v1/reconcile is unauthenticated. "
               "Set it in production.")
     t = threading.Thread(
-        target=ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever,
+        target=ThreadingHTTPServer((BIND, PORT), Handler).serve_forever,
         daemon=True)
     t.start()
     print(f"vouch runner listening on :{PORT}, polling {CONTROLPLANE_URL} "
