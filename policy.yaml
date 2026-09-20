@@ -1,0 +1,17 @@
+# Task-scoped capabilities: each task gets ONLY the tools it needs.
+# Anything not listed is denied and the denial itself gets a signed receipt.
+tasks:
+  deploy-staging:
+    agent: "agent-001"
+    allow:
+      - read_file
+      - run_tests
+      - deploy_staging
+    note: "Staging deploy pipeline. No production or destructive tools."
+
+  db-migration-review:
+    agent: "agent-002"
+    allow:
+      - read_file
+      - run_tests
+    note: "Read-only review task. Cannot deploy or touch databases."
