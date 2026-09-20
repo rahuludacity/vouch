@@ -1,0 +1,86 @@
+# Vouch Phase 1 — local end-to-end topology (ARCHITECTURE.md §9).
+#
+#   gatekeeper :9000  (policy-enforcing MCP proxy)
+#   receipts   :9001  (durable receipt service)
+#   upstream   :9002  (demo upstream, internal only)
+#
+# Docker is not available on the build VM; this file is for real hosts.
+# The services bind 127.0.0.1, so Linux hosts use `network_mode: host` to
+# keep the frozen MCP transport semantics byte-identical to local runs.
+#
+# Service-token wiring: the SAME token must reach the receipt service and
+# the gatekeeper. Generate one and export it before `compose up`:
+#
+#   export RECEIPT_SVC_TOKEN=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+#   docker compose up --build
+
+services:
+  tenants-init:
+    build: .
+    environment:
+      GATEKEEPER_TENANTS_PATH: /tenants/tenants.json
+    volumes:
+      - tenants-data:/tenants
+    # `create` exits non-zero when the tenant already exists: re-runs are safe.
+    command: >
+      sh -c 'python -m gatekeeper.tenants create acme 2>/dev/null || true;
+             python -m gatekeeper.tenants create globex 2>/dev/null || true'
+
+  receipts:
+    build: .
+    network_mode: host
+    depends_on:
+      tenants-init:
+        condition: service_completed_successfully
+    environment:
+      RECEIPT_PORT: "9001"
+      RECEIPT_DB: /data/receipts.db
+      RECEIPT_SVC_TOKEN: ${RECEIPT_SVC_TOKEN:?set RECEIPT_SVC_TOKEN first}
+      TENANTS_PATH: /tenants/tenants.json
+    volumes:
+      - receipts-data:/data
+      - tenants-data:/tenants:ro
+    command: ["python", "-m", "services.receipts.app"]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9001/v1/health', timeout=3)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  upstream:
+    build: .
+    network_mode: host
+    environment:
+      UPSTREAM_PORT: "9002"
+    command: ["python", "demo/upstream.py"]
+
+  gatekeeper:
+    build: .
+    network_mode: host
+    depends_on:
+      tenants-init:
+        condition: service_completed_successfully
+      receipts:
+        condition: service_healthy
+      upstream:
+        condition: service_started
+    environment:
+      GATEKEEPER_PORT: "9000"
+      GATEKEEPER_UPSTREAM: http://127.0.0.1:9002/mcp
+      GATEKEEPER_TENANTS_PATH: /tenants/tenants.json
+      GATEKEEPER_RECEIPTS_PATH: /spool/receipts.jsonl
+      GATEKEEPER_POLICY_PATH: /config/policy.yaml
+      RECEIPT_SVC_URL: http://127.0.0.1:9001
+      RECEIPT_SVC_TOKEN: ${RECEIPT_SVC_TOKEN:?set RECEIPT_SVC_TOKEN first}
+      RECEIPT_FLUSH_INTERVAL: "5.0"
+    volumes:
+      - tenants-data:/tenants:ro
+      - spool-data:/spool
+      - ./demo/policy.yaml:/config/policy.yaml:ro
+    command: ["python", "-m", "gatekeeper.proxy"]
+
+volumes:
+  tenants-data: # shared tenant registry (gatekeeper + receipt service)
+  receipts-data: # SQLite receipt database
+  spool-data: # gatekeeper local fallback log (durable spool of record)

@@ -27,6 +27,11 @@ Env:  GATEKEEPER_PORT           listen port (default 9000)
       GATEKEEPER_UPSTREAM       upstream MCP endpoint (default http://127.0.0.1:9001/mcp)
       GATEKEEPER_TENANTS_PATH   tenant registry file (default <repo>/tenants.json)
       GATEKEEPER_RECEIPTS_PATH  receipt ledger file (default <repo>/receipts.jsonl)
+      GATEKEEPER_POLICY_PATH    policy file, v1 or v2 schema (default <repo>/policy.yaml)
+      RECEIPT_SVC_URL           receipt service base (default http://127.0.0.1:9001;
+                                empty disables remote ingest -> local file only)
+      RECEIPT_SVC_TOKEN         bearer token for POST /v1/ingest (default "")
+      RECEIPT_FLUSH_INTERVAL    flusher pass interval in seconds (default 5.0)
 """
 import json
 import os
@@ -37,13 +42,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import yaml
 
+from . import policy_v2
+from .ingest import ReceiptEmitter
 from .receipts import ReceiptLog
 from .tenants import TenantRegistry
 
 HERE = os.path.dirname(__file__)
 LISTEN_PORT = int(os.environ.get("GATEKEEPER_PORT", "9000"))
 UPSTREAM = os.environ.get("GATEKEEPER_UPSTREAM", "http://127.0.0.1:9001/mcp")
-POLICY_PATH = os.path.join(HERE, "..", "policy.yaml")
+POLICY_PATH = os.environ.get(
+    "GATEKEEPER_POLICY_PATH", os.path.join(HERE, "..", "policy.yaml")
+)
 TENANTS_PATH = os.environ.get(
     "GATEKEEPER_TENANTS_PATH", os.path.join(HERE, "..", "tenants.json")
 )
@@ -54,8 +63,12 @@ DEFAULT_ACCEPT = "application/json, text/event-stream"
 
 
 def load_policy():
+    """Load the policy file (v1 or v2 schema) -> compiled policy_v2.Policy.
+
+    v1 files are upgraded in memory via upgrade_v1_policy(): byte-for-byte
+    file compatibility, zero behavior change (§5.3)."""
     with open(POLICY_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)["tasks"]
+        return policy_v2.Policy.from_dict(yaml.safe_load(f))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -63,6 +76,9 @@ class Handler(BaseHTTPRequestHandler):
     registry = TenantRegistry(TENANTS_PATH)
     registry.ensure("default")  # requests without X-Tenant-Id land here
     log = ReceiptLog(RECEIPT_PATH, registry)
+    # Receipt emitter: POSTs per-tenant receipts to the receipt service;
+    # any ingest failure falls back to the local ReceiptLog file above.
+    emitter = ReceiptEmitter(registry, log)
 
     sessions = {}  # Mcp-Session-Id -> tenant_id
     sessions_lock = threading.Lock()
@@ -287,27 +303,24 @@ class Handler(BaseHTTPRequestHandler):
         tool = (req.get("params") or {}).get("name", "")
         args = (req.get("params") or {}).get("arguments", {})
 
-        task = self.policy.get(task_id) if task_id else None
-        allowed = bool(task) and tool in task.get("allow", [])
+        allowed, reason, rule_id = self.policy.decide(task_id, tool, args)
+        policy_version = self.policy.version_for(task_id)
 
         if not allowed:
-            reason = (
-                f"task '{task_id}' is not granted tool '{tool}'"
-                if task
-                else f"unknown task '{task_id}'"
-            )
-            receipt = self.log.record(
+            receipt = self.emitter.emit(
+                tenant_id=tenant_id,
                 task_id=task_id or "unknown",
                 agent_id=agent_id,
                 tool=tool,
                 args=args,
                 decision="deny",
                 reason=reason,
-                tenant_id=tenant_id,
+                rule_id=rule_id,
+                policy_version=policy_version,
             )
             print(
                 f"[DENY] tenant={tenant_id} task={task_id} agent={agent_id} "
-                f"tool={tool} receipt={receipt['seq']}"
+                f"tool={tool} rule={rule_id} receipt={receipt['seq']}"
             )
             return self._send_rpc(
                 self._rpc_error(
@@ -319,18 +332,20 @@ class Handler(BaseHTTPRequestHandler):
         up = self._upstream_request("POST", json.dumps(req).encode("utf-8"))
         session_id, _ = self._relay_response(up)
         self._bind_session(session_id, tenant_id)
-        receipt = self.log.record(
+        receipt = self.emitter.emit(
+            tenant_id=tenant_id,
             task_id=task_id,
             agent_id=agent_id,
             tool=tool,
             args=args,
             decision="allow",
             reason=None,
-            tenant_id=tenant_id,
+            rule_id=rule_id,
+            policy_version=policy_version,
         )
         print(
             f"[ALLOW] tenant={tenant_id} task={task_id} agent={agent_id} "
-            f"tool={tool} receipt={receipt['seq']}"
+            f"tool={tool} rule={rule_id} receipt={receipt['seq']}"
         )
 
     def do_GET(self):

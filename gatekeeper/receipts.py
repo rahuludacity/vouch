@@ -28,6 +28,43 @@ import threading
 import time
 
 
+def build_receipt(*, seq, prev_hash, tenant_id, kid, key, task_id, agent_id,
+                  tool, args, decision, reason=None, rule_id=None,
+                  policy_version=None, ts=None):
+    """Construct and HMAC-sign one receipt body (no I/O).
+
+    Extracted from ReceiptLog.record so the gatekeeper can mint
+    per-tenant-chained receipts for the receipt service with the exact same
+    crypto as the local v1 file fallback. `rule_id` / `policy_version` are
+    the v2 fields (§6); None keeps v1-shaped receipts, which still verify.
+    """
+    body = {
+        "seq": seq,
+        "ts": round(time.time(), 3) if ts is None else ts,
+        "tenant_id": tenant_id,
+        "kid": kid,
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "tool": tool,
+        "args_sha256": hashlib.sha256(
+            json.dumps(args, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest(),
+        "decision": decision,  # "allow" | "deny"
+        "reason": reason,
+        "rule_id": rule_id,
+        "policy_version": policy_version,
+        "prev_hash": prev_hash,
+    }
+    body["hash"] = hashlib.sha256(
+        prev_hash.encode("utf-8")
+        + json.dumps(body, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    body["sig"] = hmac.new(
+        key, json.dumps(body, sort_keys=True).encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return body
+
+
 class _StaticKeyResolver:
     """Adapts a single v0-style key to the resolver interface."""
 
@@ -62,32 +99,26 @@ class ReceiptLog:
                     self.prev_hash = r["hash"]
 
     def record(self, *, task_id, agent_id, tool, args, decision,
-               reason=None, tenant_id="default"):
+               reason=None, tenant_id="default", rule_id=None,
+               policy_version=None):
         kid, key = self.resolver.signing_key(tenant_id)
         with self._lock:
             self.seq += 1
-            body = {
-                "seq": self.seq,
-                "ts": round(time.time(), 3),
-                "tenant_id": tenant_id,
-                "kid": kid,
-                "task_id": task_id,
-                "agent_id": agent_id,
-                "tool": tool,
-                "args_sha256": hashlib.sha256(
-                    json.dumps(args, sort_keys=True, default=str).encode("utf-8")
-                ).hexdigest(),
-                "decision": decision,  # "allow" | "deny"
-                "reason": reason,
-                "prev_hash": self.prev_hash,
-            }
-            body["hash"] = hashlib.sha256(
-                self.prev_hash.encode("utf-8")
-                + json.dumps(body, sort_keys=True).encode("utf-8")
-            ).hexdigest()
-            body["sig"] = hmac.new(
-                key, json.dumps(body, sort_keys=True).encode("utf-8"), hashlib.sha256
-            ).hexdigest()
+            body = build_receipt(
+                seq=self.seq,
+                prev_hash=self.prev_hash,
+                tenant_id=tenant_id,
+                kid=kid,
+                key=key,
+                task_id=task_id,
+                agent_id=agent_id,
+                tool=tool,
+                args=args,
+                decision=decision,
+                reason=reason,
+                rule_id=rule_id,
+                policy_version=policy_version,
+            )
             self.prev_hash = body["hash"]
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(body) + "\n")
