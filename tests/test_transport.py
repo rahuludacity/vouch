@@ -34,6 +34,7 @@ os.environ["GATEKEEPER_RECEIPTS_PATH"] = os.path.join(TMP, "receipts.jsonl")
 
 from gatekeeper import proxy  # noqa: E402  (reads env above at import)
 from gatekeeper.receipts import ReceiptLog  # noqa: E402
+from gatekeeper.policy_v2 import Policy, Rule  # noqa: E402
 
 GK = ThreadingHTTPServer(("127.0.0.1", 0), proxy.Handler)
 GK_PORT = GK.socket.getsockname()[1]
@@ -294,6 +295,78 @@ class TransportTest(unittest.TestCase):
             urllib.request.urlopen(req, timeout=10)
         self.assertEqual(cm.exception.code, 404)
 
+
+
+
+class M4OrderingTest(unittest.TestCase):
+    """M-4: the allow receipt is emitted BEFORE the upstream call.
+
+    The gatekeeper authorizes, then (1) emits the allow receipt, (2)
+    forwards upstream. The receipt records the authorization/execution
+    intent — not a successful upstream result — so a crash between
+    authorization and forward can never produce an action with no receipt.
+    Uses proxy.Handler with all I/O stubbed; independent of the live
+    servers above.
+    """
+
+    def _policy(self, allow=True):
+        allow_rules = [Rule.from_dict({"rule_id": "r1", "tool": "read_file"})] \
+            if allow else []
+        return Policy({"task1": {"version": 1, "allow": allow_rules,
+                                 "deny": []}}, version=1)
+
+    def _handler(self, policy, events):
+        h = object.__new__(proxy.Handler)
+
+        class Emitter:
+            def emit(self, **kw):
+                events.append(("emit", kw["decision"]))
+                return {"seq": len(events)}
+
+        h.emitter = Emitter()
+        h.policy = policy
+        h._upstream_request = lambda *a, **k: events.append(("upstream",))
+        h._relay_response = lambda up: events.append(("relay",)) or ("s1", None)
+        h._bind_session = lambda sid, tid: events.append(("bind",))
+        h._send_rpc = lambda msg, session_id=None: events.append(("send_rpc",))
+        h._rpc_error = lambda req_id, code, msg: {"error": msg}
+        return h
+
+    def _req(self):
+        return {"params": {"name": "read_file",
+                           "arguments": {"path": "/data/a.csv"}}}
+
+    def test_allow_receipt_emitted_before_upstream(self):
+        events = []
+        h = self._handler(self._policy(allow=True), events)
+        h._handle_tools_call(self._req(), 1, "tenant1", "agent1", "task1")
+        kinds = [e[0] for e in events]
+        self.assertEqual(kinds, ["emit", "upstream", "relay", "bind"])
+        self.assertEqual(events[0], ("emit", "allow"))
+
+    def test_deny_receipted_without_upstream(self):
+        events = []
+        h = self._handler(self._policy(allow=False), events)
+        h._handle_tools_call(self._req(), 2, "tenant1", "agent1", "task1")
+        kinds = [e[0] for e in events]
+        self.assertIn(("emit", "deny"), events)
+        self.assertNotIn("upstream", kinds)
+        self.assertIn("send_rpc", kinds)
+
+    def test_receipt_survives_upstream_crash(self):
+        # The crash window is closed: even if the forward explodes, the
+        # allow receipt was already emitted.
+        events = []
+        h = self._handler(self._policy(allow=True), events)
+
+        def boom(*a, **k):
+            events.append(("upstream",))
+            raise ConnectionError("upstream exploded")
+
+        h._upstream_request = boom
+        with self.assertRaises(ConnectionError):
+            h._handle_tools_call(self._req(), 3, "tenant1", "agent1", "task1")
+        self.assertEqual([e[0] for e in events], ["emit", "upstream"])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

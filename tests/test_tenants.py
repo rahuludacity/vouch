@@ -12,6 +12,46 @@ sys.path.insert(0, REPO)
 
 from gatekeeper.tenants import TenantRegistry  # noqa: E402
 from gatekeeper.receipts import ReceiptLog  # noqa: E402
+from gatekeeper.controlplane import parse_deployment_token  # noqa: E402
+import hashlib as _hashlib  # noqa: E402
+import hmac as _hmac  # noqa: E402
+
+
+def _mac(key_hex, dep_id, tenant_id, issued):
+    return _hmac.new(bytes.fromhex(key_hex),
+                     f"{dep_id}.{tenant_id}.{issued}".encode("utf-8"),
+                     _hashlib.sha256).hexdigest()[:32]
+
+
+class DeploymentTokenParserTest(unittest.TestCase):
+    """H-1: the deployment credential parser accepts only well-formed tokens,
+    and the MAC binds deployment_id + tenant_id + issued epoch."""
+
+    def test_round_trip(self):
+        dep_id = "dep_" + "ab" * 8
+        key = "00" * 32
+        sig = _mac(key, dep_id, "acme", 1700000000)
+        tok = f"vouch_dep_{dep_id}_acme_1700000000_{sig}"
+        parsed = parse_deployment_token(tok)
+        self.assertEqual(parsed, (dep_id, "acme", 1700000000, sig))
+
+    def test_malformed_rejected(self):
+        for bad in ("", "not-a-token", "vouch_dep_short",
+                    "vouch_dep_dep_abababababababab_acme_notanepoch_" + "cd" * 16,
+                    "vouch_dep_dep_ABABABABABABABAB_acme_1700000000_" + "cd" * 16,
+                    "vouch_dep_dep_abababababababab_acme_1700000000_cdcd"):
+            self.assertIsNone(parse_deployment_token(bad), bad)
+
+    def test_mac_binds_all_three_fields(self):
+        dep_id = "dep_" + "ab" * 8
+        key = "00" * 32
+        sig = _mac(key, dep_id, "acme", 1700000000)
+        # any change to tenant/epoch/dep must change the MAC: a token cut
+        # from another deployment cannot be replayed here.
+        self.assertNotEqual(sig, _mac(key, dep_id, "evil", 1700000000))
+        self.assertNotEqual(sig, _mac(key, dep_id, "acme", 1700000001))
+        self.assertNotEqual(sig, _mac(key, "dep_" + "ff" * 8, "acme",
+                                      1700000000))
 
 
 class TenantRegistryTest(unittest.TestCase):

@@ -22,7 +22,16 @@ import urllib.request
 import urllib.error
 
 GATE = os.environ.get("GATEKEEPER_URL", "http://127.0.0.1:9000/mcp")
-TENANT = os.environ.get("VOUCH_TENANT", "demo")
+# Identity: the runner injects VOUCH_*_ID env vars into the agent container
+# (§2.5); the legacy VOUCH_TENANT and the demo defaults still work.
+TENANT = os.environ.get("VOUCH_TENANT_ID") or os.environ.get("VOUCH_TENANT", "demo")
+TASK_ID = os.environ.get("VOUCH_TASK_ID", "deploy-staging")
+AGENT_ID = os.environ.get("VOUCH_AGENT_ID", "agent-001")
+# H-1: the runner injects the per-deployment gatekeeper credential
+# (VOUCH_DEPLOYMENT_TOKEN) into the agent container. The agent presents it
+# as X-Deployment-Token on every request — the gatekeeper validates it
+# before honoring X-Tenant-Id/X-Agent-Id/X-Task-Id. No credential, no calls.
+DEPLOYMENT_TOKEN = os.environ.get("VOUCH_DEPLOYMENT_TOKEN", "")
 
 
 def parse_sse(raw):
@@ -63,6 +72,8 @@ class McpClient:
             "X-Task-Id": self.task_id,
             "X-Agent-Id": self.agent_id,
         }
+        if DEPLOYMENT_TOKEN:
+            headers["X-Deployment-Token"] = DEPLOYMENT_TOKEN
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
         req = urllib.request.Request(
@@ -129,11 +140,10 @@ def run_scenario(task_id, agent_id, calls):
     for label, tool, args in calls:
         show(label, client.call_tool(tool, args))
     # clean session teardown (MCP DELETE)
-    req = urllib.request.Request(
-        GATE,
-        headers={"Mcp-Session-Id": client.session_id, "X-Tenant-Id": TENANT},
-        method="DELETE",
-    )
+    headers = {"Mcp-Session-Id": client.session_id, "X-Tenant-Id": TENANT}
+    if DEPLOYMENT_TOKEN:
+        headers["X-Deployment-Token"] = DEPLOYMENT_TOKEN
+    req = urllib.request.Request(GATE, headers=headers, method="DELETE")
     try:
         urllib.request.urlopen(req, timeout=10)
         print("  session terminated (DELETE 202)")
@@ -141,10 +151,10 @@ def run_scenario(task_id, agent_id, calls):
         print(f"  session teardown -> HTTP {e.code}")
 
 
-print(f"Scenario 1: legit staging deploy (tenant={TENANT}, task=deploy-staging)")
+print(f"Scenario 1: legit staging deploy (tenant={TENANT}, task={TASK_ID})")
 run_scenario(
-    "deploy-staging",
-    "agent-001",
+    TASK_ID,
+    AGENT_ID,
     [
         ("read_file", "read_file", {"path": "app.py"}),
         ("run_tests", "run_tests", {"suite": "unit"}),
@@ -155,8 +165,8 @@ run_scenario(
 print()
 print("Scenario 2: compromised agent tries to drop the database")
 run_scenario(
-    "deploy-staging",
-    "agent-001",
+    TASK_ID,
+    AGENT_ID,
     [("delete_database", "delete_database", {"target": "prod"})],
 )
 

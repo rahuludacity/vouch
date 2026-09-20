@@ -1,0 +1,185 @@
+# Vouch Phase 2 — local end-to-end topology (ARCHITECTURE.md §9, §1 port map).
+#
+#   gatekeeper   :9000  (policy-enforcing MCP proxy)
+#   receipts     :9001  (durable receipt service)
+#   controlplane :9002  (tenant provisioning, key authority, policy store)
+#   upstream     :9010  (demo upstream, internal only)
+#
+# Docker is not available on the build VM; this file is for real hosts.
+# The services bind 127.0.0.1, so Linux hosts use `network_mode: host` to
+# keep the frozen MCP transport semantics byte-identical to local runs.
+#
+# Token wiring (all from `python3 -m services.controlplane.seed_tokens`):
+#   export RECEIPT_SVC_TOKEN=<receipt-service token>     # gatekeeper + receipts
+#   export GATEKEEPER_SVC_TOKEN=<gatekeeper token>       # gatekeeper
+#   export CP_INVALIDATE_TOKEN=<gatekeeper token>        # controlplane (same value)
+#   export RECEIPT_FANIN_TOKEN=<receipt-service token>   # controlplane (usage fan-in)
+#   export BILLING_SVC_TOKEN=<from seed_tokens>
+# Then `docker compose up --build`.
+#
+# Key-authority cutover: the gatekeeper and receipt service only talk to the
+# control plane when CONTROLPLANE_URL is set. Leave it unset to keep the v1
+# file-backed tenants.json behavior. After `migrate_tenants` moves the
+# registry into the control plane DB, set CONTROLPLANE_URL everywhere.
+
+services:
+  tenants-init:
+    build: .
+    environment:
+      GATEKEEPER_TENANTS_PATH: /tenants/tenants.json
+    volumes:
+      - tenants-data:/tenants
+    # `create` exits non-zero when the tenant already exists: re-runs are safe.
+    command: >
+      sh -c 'python -m gatekeeper.tenants create acme 2>/dev/null || true;
+             python -m gatekeeper.tenants create globex 2>/dev/null || true'
+
+  receipts:
+    build: .
+    network_mode: host
+    depends_on:
+      tenants-init:
+        condition: service_completed_successfully
+    environment:
+      RECEIPT_PORT: "9001"
+      RECEIPT_DB: /data/receipts.db
+      RECEIPT_SVC_TOKEN: ${RECEIPT_SVC_TOKEN:-dev-token}
+      TENANTS_PATH: /tenants/tenants.json
+      # CONTROLPLANE_URL: http://127.0.0.1:9002
+      # CONTROLPLANE_SVC_TOKEN: ${RECEIPT_SVC_TOKEN:-dev-token}
+    volumes:
+      - receipts-data:/data
+      - tenants-data:/tenants:ro
+    command: ["python", "-m", "services.receipts.app"]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9001/v1/health', timeout=3)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  controlplane:
+    build: .
+    network_mode: host
+    environment:
+      CONTROLPLANE_PORT: "9002"
+      CONTROLPLANE_DB: /data/controlplane.db
+      # Server-side push-invalidate (§4.3): the control plane tells the
+      # gatekeeper to drop cached bundles on rotate/suspend/plan-change.
+      # The push is bearer-gated; without the token it is a silent no-op
+      # and the gatekeeper's 60s TTL remains the backstop.
+      GATEKEEPER_URL: http://127.0.0.1:9000
+      # CONTROLPLANE_INVALIDATE_TOKEN: ${CP_INVALIDATE_TOKEN:-}
+      # RECEIPT_SVC_URL: http://127.0.0.1:9001
+      # RECEIPT_FANIN_TOKEN: ${RECEIPT_FANIN_TOKEN:-}
+    volumes:
+      - controlplane-data:/data
+    command: ["python", "-m", "services.controlplane.app"]
+
+  # Phase 5 — billing (:9004). Stripe TEST MODE only: without
+  # STRIPE_TEST_SECRET_KEY it boots an explicitly labeled offline mock
+  # backend (no real charges possible). With sk_test_* set it talks to
+  # Stripe test mode; non-sk_test_* keys are refused at startup.
+  # Webhooks verified (t=,v1= HMAC, 300s tolerance), idempotent.
+  billing:
+    build: .
+    network_mode: host
+    depends_on:
+      controlplane:
+        condition: service_started
+      receipts:
+        condition: service_healthy
+    environment:
+      BILLING_PORT: "9004"
+      BILLING_DB: /data/billing.db
+      CONTROLPLANE_URL: http://127.0.0.1:9002
+      RECEIPT_SVC_URL: http://127.0.0.1:9001
+      # Service tokens from `python3 -m services.controlplane.seed_tokens`:
+# BILLING_SVC_TOKEN: <redacted>
+# RECEIPT_SVC_TOKEN: <redacted>
+      # Optional Stripe test mode (leave unset for the offline mock):
+# STRIPE_TEST_SECRET_KEY: <redacted>
+# STRIPE_TEST_WEBHOOK_SECRET: <redacted>
+# STRIPE_PRICE_PRO: <redacted>
+# STRIPE_PRICE_TEAM: <redacted>
+    volumes:
+      - billing-data:/data
+    command: ["python", "-m", "services.billing.app"]
+
+  upstream:
+    build: .
+    network_mode: host
+    environment:
+      UPSTREAM_PORT: "9010"
+    command: ["python", "demo/upstream.py"]
+
+  # Phase 3 — agent runner (:9003). Polls the control plane's desired state,
+  # runs one sandboxed container per deployment, reports status back.
+  #
+  # Sandbox topology (ARCHITECTURE.md §2.5): on startup the runner creates the
+  # docker network `vouch-sandbox` with internal=true (no route to the outside
+  # world). Agent containers attach ONLY to that network; the gatekeeper must
+  # be the only other member — that membership IS the egress allowlist
+  # ({http://gatekeeper:9000}). The gatekeeper service above uses
+  # network_mode: host, which cannot join extra networks; on a real docker
+  # host run the gatekeeper WITHOUT host mode and attach it to vouch-sandbox
+  # (uncomment the networks block below) so agents can reach it and nothing
+  # else. Until then the runner still reconciles correctly — only the
+  # sandbox-network attach of the gatekeeper is a host-topology step.
+  runner:
+    build: .
+    network_mode: host
+    depends_on:
+      controlplane:
+        condition: service_started
+    environment:
+      RUNNER_PORT: "9003"
+      CONTROLPLANE_URL: http://127.0.0.1:9002
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?}
+      # Gatekeeper MCP endpoint AS SEEN BY AGENT CONTAINERS on vouch-sandbox.
+      GATEKEEPER_AGENT_URL: http://gatekeeper:9000/mcp
+      RUNNER_POLL_INTERVAL: "10"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: ["python", "-m", "services.runner.app"]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9003/v1/health', timeout=3)"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  gatekeeper:
+    build: .
+    network_mode: host
+    depends_on:
+      tenants-init:
+        condition: service_completed_successfully
+      receipts:
+        condition: service_healthy
+      upstream:
+        condition: service_started
+    environment:
+      GATEKEEPER_PORT: "9000"
+      GATEKEEPER_UPSTREAM: http://127.0.0.1:9010/mcp
+      GATEKEEPER_TENANTS_PATH: /tenants/tenants.json
+      GATEKEEPER_RECEIPTS_PATH: /spool/receipts.jsonl
+      GATEKEEPER_POLICY_PATH: /config/policy.yaml
+      RECEIPT_SVC_URL: http://127.0.0.1:9001
+      RECEIPT_SVC_TOKEN: ${RECEIPT_SVC_TOKEN:-dev-token}
+      RECEIPT_FLUSH_INTERVAL: "5.0"
+      # CONTROLPLANE_URL: http://127.0.0.1:9002
+      # GATEKEEPER_SVC_TOKEN: ${GATEKEEPER_SVC_TOKEN:-}
+      POLICY_POLL_INTERVAL: "15"
+    volumes:
+      - tenants-data:/tenants:ro
+      - spool-data:/spool
+      - ./policy.yaml:/config/policy.yaml:ro
+    command: ["python", "-m", "gatekeeper.proxy"]
+
+volumes:
+  tenants-data: # shared tenant registry (gatekeeper + receipt service, v1 file mode)
+  receipts-data: # SQLite receipt database
+  controlplane-data: # SQLite control-plane database (tenants, keys, policies)
+  billing-data: # SQLite billing database (customers, subs, webhook idempotency)
+  spool-data: # gatekeeper local fallback log (durable spool of record)
