@@ -1,0 +1,160 @@
+"""Tests for per-tenant signing keys: registry, rotation, and
+tenant-scoped receipt signing/verification (incl. cross-tenant forgery)."""
+import json
+import os
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+sys.path.insert(0, REPO)
+
+from gatekeeper.tenants import TenantRegistry  # noqa: E402
+from gatekeeper.receipts import ReceiptLog  # noqa: E402
+
+
+class TenantRegistryTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vouch-tenants-")
+        self.reg = TenantRegistry(os.path.join(self.tmp, "tenants.json"))
+
+    def test_create_and_signing_key(self):
+        kid, key_hex = self.reg.create("acme")
+        self.assertEqual(kid, "k1")
+        self.assertEqual(len(bytes.fromhex(key_hex)), 32)  # 256-bit
+        rkid, rkey = self.reg.signing_key("acme")
+        self.assertEqual((rkid, rkey), ("k1", bytes.fromhex(key_hex)))
+
+    def test_create_duplicate_raises(self):
+        self.reg.create("acme")
+        with self.assertRaises(KeyError):
+            self.reg.create("acme")
+
+    def test_ensure_is_idempotent(self):
+        k1 = self.reg.ensure("acme")
+        k2 = self.reg.ensure("acme")
+        self.assertEqual(k1, k2)
+
+    def test_unknown_tenant_raises(self):
+        with self.assertRaises(KeyError):
+            self.reg.signing_key("ghost")
+
+    def test_persists_across_instances(self):
+        self.reg.create("acme")
+        reg2 = TenantRegistry(os.path.join(self.tmp, "tenants.json"))
+        self.assertEqual(reg2.signing_key("acme"), self.reg.signing_key("acme"))
+
+    def test_rotate_mints_new_key(self):
+        kid1, _ = self.reg.create("acme")
+        kid2, key2 = self.reg.rotate("acme")
+        self.assertNotEqual(kid1, kid2)
+        self.assertEqual(self.reg.signing_key("acme")[0], kid2)
+        keys = self.reg.verification_keys("acme")
+        self.assertIn(kid1, keys)
+        self.assertIn(kid2, keys)
+        self.assertEqual(keys[kid2], bytes.fromhex(key2))
+
+    def test_list_tenants(self):
+        self.reg.create("acme")
+        self.reg.create("globex")
+        info = self.reg.list_tenants()
+        self.assertEqual(set(info), {"acme", "globex"})
+        self.assertEqual(info["acme"]["current_kid"], "k1")
+
+
+class TenantReceiptsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vouch-receipts-")
+        self.reg = TenantRegistry(os.path.join(self.tmp, "tenants.json"))
+        self.reg.create("acme")
+        self.reg.create("globex")
+        self.path = os.path.join(self.tmp, "receipts.jsonl")
+        self.log = ReceiptLog(self.path, self.reg)
+
+    def record(self, tenant, tool="read_file", decision="allow"):
+        return self.log.record(task_id="t1", agent_id="a1", tool=tool,
+                               args={"x": 1}, decision=decision,
+                               tenant_id=tenant)
+
+    def test_receipt_carries_tenant_and_kid(self):
+        r = self.record("acme")
+        self.assertEqual(r["tenant_id"], "acme")
+        self.assertEqual(r["kid"], "k1")
+        ok, failures = self.log.verify()
+        self.assertTrue(ok, failures)
+
+    def test_tenants_get_independent_chains(self):
+        ra = self.record("acme")
+        rg = self.record("globex")
+        self.assertNotEqual(ra["sig"], rg["sig"])  # different keys
+        ok, failures = self.log.verify()
+        self.assertTrue(ok, failures)
+
+    def test_cross_tenant_forgery_detected(self):
+        self.record("acme")  # signed with acme's key
+        # attacker rewrites the receipt to look like globex's
+        lines = open(self.path).read().strip().split("\n")
+        r = json.loads(lines[0])
+        r["tenant_id"] = "globex"
+        with open(self.path, "w") as f:
+            f.write(json.dumps(r) + "\n")
+        ok, failures = ReceiptLog(self.path, self.reg).verify()
+        self.assertFalse(ok)
+        self.assertTrue(any("bad signature" in f for f in failures),
+                        failures)
+
+    def test_body_tamper_detected(self):
+        self.record("acme", decision="deny")
+        lines = open(self.path).read().strip().split("\n")
+        r = json.loads(lines[0])
+        r["decision"] = "allow"  # rewrite history
+        with open(self.path, "w") as f:
+            f.write(json.dumps(r) + "\n")
+        ok, failures = ReceiptLog(self.path, self.reg).verify()
+        self.assertFalse(ok)
+        self.assertTrue(any("hash mismatch" in f for f in failures), failures)
+
+    def test_chain_reorder_detected(self):
+        self.record("acme")
+        self.record("acme")
+        lines = open(self.path).read().strip().split("\n")
+        with open(self.path, "w") as f:
+            f.write(lines[1] + "\n" + lines[0] + "\n")
+        ok, failures = ReceiptLog(self.path, self.reg).verify()
+        self.assertFalse(ok)
+        self.assertTrue(any("seq break" in f or "chain break" in f
+                            for f in failures), failures)
+
+    def test_old_receipts_verify_after_rotation(self):
+        before = self.record("acme")
+        self.reg.rotate("acme")
+        after = self.record("acme")
+        self.assertNotEqual(before["kid"], after["kid"])
+        self.assertNotEqual(before["sig"], after["sig"])
+        ok, failures = ReceiptLog(self.path, self.reg).verify()
+        self.assertTrue(ok, failures)
+
+    def test_receipt_for_unknown_tenant_fails_verify(self):
+        self.record("acme")
+        lines = open(self.path).read().strip().split("\n")
+        r = json.loads(lines[0])
+        r["tenant_id"] = "ghost"
+        with open(self.path, "w") as f:
+            f.write(json.dumps(r) + "\n")
+        ok, failures = ReceiptLog(self.path, self.reg).verify()
+        self.assertFalse(ok)
+        self.assertTrue(any("unknown tenant" in f for f in failures), failures)
+
+    def test_legacy_static_key_still_works(self):
+        # v0 behavior: plain string key, no tenant involved
+        path = os.path.join(self.tmp, "legacy.jsonl")
+        log = ReceiptLog(path, "dev-only-change-me")
+        log.record(task_id="t", agent_id="a", tool="read_file",
+                   args={}, decision="allow")
+        ok, failures = ReceiptLog(path, "dev-only-change-me").verify()
+        self.assertTrue(ok, failures)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
