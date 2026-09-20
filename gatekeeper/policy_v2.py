@@ -282,7 +282,22 @@ def _regex_worker_main(conn):
     cannot do this: CPython's re engine never releases the GIL during a
     match, so the parent thread can't even wake up to notice the timeout
     — verified empirically: 59s elapsed instead of the 0.25s budget.)
+
+    Lifecycle: workers are reaped by _RegexProcessPool.close(), which the
+    gatekeeper calls from its SIGTERM/SIGINT handler (a plain daemon
+    atexit is not enough: SIGTERM skips atexit, and PDEATHSIG is
+    thread-scoped — the worker is forked from a request handler thread,
+    so handler-thread exit would wrongly kill pooled workers).
+
+    The worker resets SIGTERM/SIGINT to default on entry: it is forked
+    from the gatekeeper *after* the shutdown handler is installed, so
+    without this it would inherit _shutdown and deadlock in close()
+    trying to take the pool lock that was held at fork time — making
+    proc.terminate() hang instead of killing it.
     """
+    import signal as _signal
+    _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+    _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
     while True:
         try:
             pattern_str, value = conn.recv()
@@ -310,6 +325,9 @@ class _RegexProcessPool:
         self._lock = _threading.Lock()
         self._idle = []  # [(Process, Connection)]
         self._live = 0
+        self._workers = {}  # id(proc) -> (proc, conn): every live worker,
+        # including ones checked out by request threads, so close() can
+        # reap them all even mid-request.
 
     def _spawn(self):
         parent_conn, child_conn = self._ctx.Pipe(duplex=True)
@@ -318,9 +336,16 @@ class _RegexProcessPool:
         proc.start()
         child_conn.close()
         self._live += 1
+        self._workers[id(proc)] = (proc, parent_conn)
         return proc, parent_conn
 
     def _discard(self, proc, conn):
+        # Idempotent: close() and a racing request thread may both discard
+        # the same worker; only the first one decrements the accounting.
+        with self._lock:
+            if self._workers.pop(id(proc), None) is None:
+                return
+            self._live -= 1
         try:
             conn.close()
         except OSError:
@@ -329,13 +354,29 @@ class _RegexProcessPool:
             if proc.is_alive():
                 proc.terminate()
             proc.join(timeout=5)
-        finally:
-            with self._lock:
-                self._live -= 1
+        except Exception:
+            pass
+
+    def close(self):
+        """Terminate every worker; the pool must not be used afterwards.
+
+        Called from the gatekeeper's SIGTERM/SIGINT handler so a shutdown
+        never leaves orphaned workers holding the listening sockets.
+        (Daemon-ness alone does not do this: SIGTERM skips atexit.)
+        Reaps checked-out workers too — an in-flight request fails closed.
+        """
+        with self._lock:
+            workers = list(self._workers.values())
+            self._idle = []
+            self._closed = True
+        for proc, conn in workers:
+            self._discard(proc, conn)
 
     def search(self, pattern_str, value, timeout):
         """re.search in a worker; (timed_out: bool, matched: bool)."""
         with self._lock:
+            if getattr(self, "_closed", False):
+                return True, False  # shutting down: caller fails closed
             if self._idle:
                 proc, conn = self._idle.pop()
             elif self._live < self._size:

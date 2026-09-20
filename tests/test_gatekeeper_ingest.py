@@ -316,9 +316,12 @@ class GatekeeperIngestTest(unittest.TestCase):
             self.assertTrue(ok, failures)
             self.assertGreaterEqual(log.seq, 2)
         finally:
-            # service back: flusher replays the spool in order
+            # service back: flusher replays the spool in order.
+            # NOTE: assign at CLASS level — tearDownClass only sees
+            # cls.receipts_proc, and an instance attribute here would
+            # shadow it and leak this replacement service.
             env = dict(os.environ, PYTHONPATH=REPO)
-            self.receipts_proc = subprocess.Popen(
+            type(self).receipts_proc = subprocess.Popen(
                 [sys.executable, "-m", "services.receipts.app"], cwd=REPO,
                 env={**env, "RECEIPT_PORT": str(self.rport),
                      "RECEIPT_DB": self.receipts_db,
@@ -573,6 +576,96 @@ class EmitterUnitTest(unittest.TestCase):
                         "healthy tenant was blocked by the hung tenant")
         # the hung tenant fell back to the local file once ingest failed
         self.assertIn("local_fallback", results["slow"])
+
+
+class RegexWorkerLifecycleTest(unittest.TestCase):
+    """SIGTERM must reap regex workers; none may be left orphaned.
+
+    Regression: forked workers inherited the gatekeeper's SIGTERM
+    handler and deadlocked in close() on the pool lock held at fork
+    time, so proc.terminate() hung and workers survived as orphans
+    under PID 1 holding the listening sockets. Workers now reset
+    SIGTERM/SIGINT to default on entry.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.policy_path = os.path.join(TMP, "policy_regex_lifecycle.yaml")
+        with open(cls.policy_path, "w", encoding="utf-8") as f:
+            f.write(
+                'tasks:\n  t:\n    version: 2\n    rules:\n'
+                '      allow:\n'
+                '      - rule_id: r1\n'
+                '        tool: read_file\n'
+                '        args: {path: {regex: "^[a-z]+$"}}\n'
+                '      deny: []\n')
+        cls.gport = free_port()
+        env = dict(os.environ, PYTHONPATH=REPO,
+                   GATEKEEPER_PORT=str(cls.gport),
+                   GATEKEEPER_UPSTREAM="http://127.0.0.1:9/mcp",  # refused
+                   GATEKEEPER_TENANTS_PATH=os.path.join(TMP, "tenants.json"),
+                   GATEKEEPER_RECEIPTS_PATH=os.path.join(
+                       TMP, "regex_lifecycle.jsonl"),
+                   GATEKEEPER_POLICY_PATH=cls.policy_path)
+        cls.proc = subprocess.Popen(
+            [sys.executable, "-m", "gatekeeper.proxy"], cwd=REPO, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                socket.create_connection(("127.0.0.1", cls.gport),
+                                         timeout=1).close()
+                break
+            except OSError:
+                time.sleep(0.2)
+        else:
+            raise AssertionError("gatekeeper never listened")
+
+    @classmethod
+    def tearDownClass(cls):
+        proc = getattr(cls, "proc", None)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def _workers(self):
+        out = subprocess.run(
+            ["ps", "--ppid", str(self.proc.pid), "-o", "pid="],
+            capture_output=True, text=True).stdout.split()
+        return [p for p in out if p]
+
+    def test_sigterm_reaps_workers_no_orphans(self):
+        # trigger regex matches so workers spawn
+        for _ in range(2):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.gport}/mcp",
+                data=json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                     "params": {"name": "read_file",
+                                "arguments": {"path": "abc"}}}).encode(),
+                headers={"Content-Type": "application/json",
+                         "X-Tenant-Id": "acme", "X-Task-Id": "t"})
+            try:
+                urllib.request.urlopen(req, timeout=10).read()
+            except urllib.error.HTTPError as e:
+                # upstream is refused on purpose; the regex already ran
+                self.assertEqual(e.code, 502)
+        workers = self._workers()
+        self.assertGreaterEqual(
+            len(workers), 1, "expected regex workers to have spawned")
+        self.proc.terminate()
+        self.proc.wait(timeout=15)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if not any(os.path.exists(f"/proc/{w}") for w in workers):
+                break
+            time.sleep(0.5)
+        orphans = [w for w in workers if os.path.exists(f"/proc/{w}")]
+        self.assertEqual(orphans, [],
+                         f"orphaned regex workers after SIGTERM: {orphans}")
 
 
 if __name__ == "__main__":

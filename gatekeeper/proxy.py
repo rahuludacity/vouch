@@ -635,6 +635,19 @@ def main():
     print(f"receipts: {RECEIPT_PATH}")
     if CP_ACTIVE:
         print("identity:   X-Deployment-Token required (H-1 per-deployment credentials)")
+    # Reap the regex worker pool on SIGTERM/SIGINT: daemon workers do not
+    # die with a SIGTERMed parent (atexit is skipped), and without this
+    # they linger as orphans still holding the listening socket.
+    import signal as _signal
+
+    def _shutdown(signum, _frame):
+        policy_v2._regex_pool.close()
+        _signal.signal(signum, _signal.SIG_DFL)
+        import os as _os
+        _os.kill(_os.getpid(), signum)
+
+    _signal.signal(_signal.SIGTERM, _shutdown)
+    _signal.signal(_signal.SIGINT, _shutdown)
     ThreadingHTTPServer((BIND, LISTEN_PORT), Handler).serve_forever()
 
 

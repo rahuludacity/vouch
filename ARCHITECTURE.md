@@ -495,6 +495,22 @@ a tenant-supplied `(a+)+$` must never hang the gatekeeper:
    pool spawns a replacement on next checkout. A runaway can never wedge
    the gatekeeper or starve other tenants' requests.
 
+   Worker lifecycle: workers are reaped by `_RegexProcessPool.close()`,
+   which the gatekeeper calls from its SIGTERM/SIGINT handler (a plain
+   daemon `atexit` is not enough: SIGTERM skips atexit). Two fork
+   hazards are handled explicitly: (1) `PR_SET_PDEATHSIG` was rejected —
+   it is thread-scoped, and workers are lazily forked from request
+   handler threads, so handler-thread exit would wrongly kill pooled
+   workers; (2) workers reset SIGTERM/SIGINT to default on entry —
+   without this they inherit the gatekeeper's shutdown handler via
+   fork, and `terminate()` makes them run `close()` against the pool
+   lock that was held at fork time, deadlocking instead of dying and
+   leaving orphans under PID 1 holding the listening sockets.
+   `close()` tracks *all* live workers (idle and checked out), and is
+   idempotent so a racing request thread can't double-decrement
+   accounting. Covered by `RegexWorkerLifecycleTest`
+   (SIGTERM → zero orphans) and the catastrophic-timeout path above.
+
 ---
 
 ## 6. Receipts v2 — durable per-tenant chains
