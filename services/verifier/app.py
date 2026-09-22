@@ -76,6 +76,13 @@ MAX_BODY = 1024 * 1024
 class VerifierState:
     """In-memory replay + rate-limit state (prototype; not durable)."""
 
+    # Hard cap on the nonce table. Nonces are reserved *before* credential
+    # verification, so an attacker can grow the table with garbage requests
+    # (only a 10-minute time prune stood in the way). 100k entries is
+    # single-digit MB; oldest entries are evicted first. Evicted nonces fall
+    # back on the request-timestamp window for replay safety.
+    MAX_NONCES = 100_000
+
     def __init__(self):
         self._lock = threading.Lock()
         self._nonces = {}          # nonce -> expiry ts
@@ -93,6 +100,10 @@ class VerifierState:
             self._prune(now)
             if nonce in self._nonces:
                 return False
+            while len(self._nonces) >= self.MAX_NONCES:
+                # dicts are insertion-ordered and every entry is stamped with
+                # a monotonic expiry, so the front of the dict is the oldest.
+                self._nonces.pop(next(iter(self._nonces)))
             self._nonces[nonce] = now + 2 * credentials.CLOCK_SKEW
             return True
 

@@ -527,5 +527,96 @@ class SiteLanesCase(unittest.TestCase):
         self.assertEqual(code, 200)
 
 
+class TestPatternLimitKeys(unittest.TestCase):
+    """Regression tests for the pattern-keyed limits fail-open (audit MEDIUM).
+
+    Limit keys must be literal action types. allow/deny use fnmatch, but
+    limits are enforced with an exact dict lookup, so a pattern key like
+    "form.*" would silently throttle nothing. Issuance must fail loudly;
+    verification of a hand-minted credential must fail closed.
+    """
+
+    def test_issue_credential_rejects_pattern_limit_key(self):
+        p_priv, p_pub = generate_keypair()
+        _, a_pub = generate_keypair()
+        with self.assertRaises(ValueError) as ctx:
+            issue_credential(
+                principal_id="p", principal_priv_hex=p_priv,
+                principal_pub_hex=p_pub, agent_id="a", agent_pub_hex=a_pub,
+                scope={"allow": ["form.*"],
+                        "limits": {"form.*": {"max_per_day": 1}}})
+        self.assertIn("form.*", str(ctx.exception))
+
+    def test_issue_delegation_rejects_pattern_limit_key(self):
+        p_priv, p_pub = generate_keypair()
+        _, a_pub = generate_keypair()
+        with self.assertRaises(ValueError):
+            issue_delegation(
+                delegator_priv_hex=p_priv, delegator_pub_hex=p_pub,
+                delegatee_pub_hex=a_pub,
+                scope={"allow": ["form.*"],
+                       "limits": {"form.?": {"max_per_day": 1}}})
+
+    def test_literal_limit_keys_still_enforced(self):
+        # Sanity: literal keys keep working and actually throttle.
+        c = make_chain(scope_sub={"allow": ["form.submit"],
+                                  "limits": {"form.submit":
+                                             {"max_per_day": 1}}})
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        req = make_request(c)
+        ok, reasons = verify_action_request(req, [c["p_pub"]], usage={})
+        self.assertTrue(ok, reasons)
+        usage = {(c["s_pub"], "form.submit", day): 1}
+        req2 = make_request(c)
+        ok, reasons = verify_action_request(req2, [c["p_pub"]], usage=usage)
+        self.assertFalse(ok)
+        self.assertTrue(any("rate limit" in r for r in reasons))
+
+    def test_verify_fails_closed_on_pattern_limit_key(self):
+        # A credential minted outside issue_credential() — hand-signed with
+        # pattern limit keys — must be refused, not verified with no limits.
+        import copy
+        c = make_chain()
+        cred = copy.deepcopy(c["cred"])
+        cred["scope"]["limits"] = {"form.*": {"max_per_day": 1}}
+        unsigned = {k: v for k, v in cred.items() if k != "signature"}
+        cred["signature"] = ed25519.sign_hex(
+            c["p_priv"], credentials.canonical(unsigned))
+        req = make_request({**c, "cred": cred})
+        ok, reasons = verify_action_request(req, [c["p_pub"]], usage={})
+        self.assertFalse(ok)
+        self.assertTrue(any("literal action types" in r for r in reasons))
+
+
+class TestNonceTableCap(unittest.TestCase):
+    """The nonce table is reserved *before* verification, so it must be
+    bounded (audit MEDIUM): flooding fresh nonces must not grow memory
+    without limit."""
+
+    def test_nonce_table_is_bounded(self):
+        import services.verifier.app as appmod
+        state = appmod.VerifierState()
+        state.MAX_NONCES = 64  # shrink for test speed; semantics unchanged
+        now = time.time()
+        for i in range(200):
+            self.assertTrue(state.check_and_reserve(f"cap-n-{i}", now))
+        self.assertLessEqual(len(state._nonces), 64)
+
+    def test_oldest_evicted_first_and_replay_still_detected(self):
+        import services.verifier.app as appmod
+        state = appmod.VerifierState()
+        state.MAX_NONCES = 8
+        now = time.time()
+        for i in range(8):
+            self.assertTrue(state.check_and_reserve(f"evict-n-{i}", now))
+        # Table full: the 9th insert evicts the oldest ("evict-n-0").
+        self.assertTrue(state.check_and_reserve("evict-n-8", now))
+        self.assertNotIn("evict-n-0", state._nonces)
+        self.assertIn("evict-n-8", state._nonces)
+        # Nonces still resident are still replay-protected.
+        self.assertFalse(state.check_and_reserve("evict-n-8", now))
+        self.assertFalse(state.check_and_reserve("evict-n-7", now))
+
+
 if __name__ == "__main__":
     unittest.main()

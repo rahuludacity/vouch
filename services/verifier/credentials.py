@@ -63,6 +63,30 @@ def _norm_scope(scope):
     }
 
 
+_PATTERN_CHARS = frozenset("*?[]!")
+
+
+def _looks_like_pattern(key):
+    """True if a scope key contains fnmatch metacharacters."""
+    return any(ch in _PATTERN_CHARS for ch in str(key))
+
+
+def _reject_pattern_limit_keys(scope):
+    """Limit keys must be literal action types, never fnmatch patterns.
+
+    allow/deny are matched with fnmatch, but limits are enforced with an
+    exact dict lookup — a pattern key like "form.*" would silently match
+    nothing and leave the action unthrottled (fail-open). Fail loudly at
+    issuance instead of silently at enforcement.
+    """
+    for key in (scope or {}).get("limits", {}):
+        if _looks_like_pattern(key):
+            raise ValueError(
+                f"limit key {key!r} looks like a pattern; limit keys must be "
+                "literal action types (e.g. 'form.submit'). Expand patterns "
+                "into their literal action types.")
+
+
 def scope_allows(scope, action_type):
     """True iff action_type passes the scope's allow/deny patterns."""
     scope = _norm_scope(scope)
@@ -93,6 +117,7 @@ def scope_narrows(child, parent):
 def issue_delegation(*, delegator_priv_hex, delegator_pub_hex,
                      delegatee_pub_hex, scope, ttl_s=86400, issued_at=None):
     """One signed delegation link. Returns the link dict (with signature)."""
+    _reject_pattern_limit_keys(scope)
     now = _ts(issued_at)
     link = {
         "delegator_pubkey": delegator_pub_hex,
@@ -122,6 +147,7 @@ def issue_credential(*, principal_id, principal_priv_hex, principal_pub_hex,
     narrow the last delegation's scope.
     """
     now = _ts(issued_at)
+    _reject_pattern_limit_keys(scope)
     scope = _norm_scope(scope)
     links = list(delegations)
     if links:
@@ -283,7 +309,15 @@ def verify_action_request(req, trusted_issuers, now=None,
     _check(scope_allows(cred["scope"], atype), reasons,
            f"action '{atype}' outside authorized scope")
     if usage is not None:
-        lim = _norm_scope(cred["scope"])["limits"].get(atype, {})
+        normed = _norm_scope(cred["scope"])
+        if any(_looks_like_pattern(k) for k in normed["limits"]):
+            # A credential minted outside issue_credential() with pattern
+            # limit keys would silently evade throttling (fail-open), so
+            # refuse it outright instead of verifying with no limits.
+            return False, reasons + [
+                "credential 'limits' keys must be literal action types, "
+                "not patterns; failing closed"]
+        lim = normed["limits"].get(atype, {})
         max_day = lim.get("max_per_day")
         if max_day is not None:
             day = time.strftime("%Y-%m-%d", time.gmtime(now))
