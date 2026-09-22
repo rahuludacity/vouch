@@ -3,6 +3,7 @@
 #   gatekeeper   :9000  (policy-enforcing MCP proxy)
 #   receipts     :9001  (durable receipt service)
 #   controlplane :9002  (tenant provisioning, key authority, policy store)
+#   verifier     :9005  (agent credential verification — Phase 8)
 #   upstream     :9010  (demo upstream, internal only)
 #
 # Docker is not available on the build VM; this file is for real hosts.
@@ -176,6 +177,36 @@ services:
       - spool-data:/spool
       - ./policy.yaml:/config/policy.yaml:ro
     command: ["python", "-m", "gatekeeper.proxy"]
+
+  # Phase 8 — agent verifier: the demand-side gateway (ARCHITECTURE.md §Phase 8).
+  # Sites POST agent credentials here for allow/deny; every decision emits a
+  # signed, hash-chained receipt (via the receipt service, local file fallback).
+  verifier:
+    build: .
+    network_mode: host
+    depends_on:
+      tenants-init:
+        condition: service_completed_successfully
+      receipts:
+        condition: service_healthy
+    environment:
+      VERIFIER_PORT: "9005"
+      VERIFIER_TENANTS_PATH: /tenants/tenants.json
+      VERIFIER_RECEIPTS_PATH: /spool/verifier-receipts.jsonl
+      VERIFIER_TRUSTED_ISSUERS: ${VERIFIER_TRUSTED_ISSUERS:-}
+      VERIFIER_PRINCIPAL_DAILY_LIMIT: ${VERIFIER_PRINCIPAL_DAILY_LIMIT:-1000}
+      RECEIPT_SVC_URL: http://127.0.0.1:9001
+      RECEIPT_SVC_TOKEN: ${RECEIPT_SVC_TOKEN:-}
+    volumes:
+      - tenants-data:/tenants:ro
+      - spool-data:/spool
+    command: ["python", "-m", "services.verifier.app"]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9005/v1/health', timeout=3)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
 volumes:
   tenants-data: # shared tenant registry (gatekeeper + receipt service, v1 file mode)

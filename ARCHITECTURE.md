@@ -572,6 +572,8 @@ services/
   billing/             # NEW (Crew B, Phase 5)
     app.py             # checkout, portal, Stripe webhook (TEST MODE)
     plans.py           # plan catalog: free/pro/team quotas
+  verifier/            # NEW (Phase 8): ed25519.py (vendored), credentials.py,
+                       #   app.py — the demand-side agent verification service
 web/
   dashboard/           # Phase 4 (built): web/dashboard/app.py — server-rendered
                        # pages (overview, receipts, policies, deployments, keys)
@@ -586,7 +588,8 @@ sdk/
                        #   node --test (18 tests)
 quickstart.sh          # Phase 6: one-command 0→1 — boots everything, provisions
                        #   a tenant, deploys an agent, verifies the chain (exit 0)
-demo/                  # v1 demo stays; Phase 3 adds e2e demo via runner
+demo/                  # v1 demo stays; Phase 3 adds e2e demo via runner;
+                       # Phase 8 adds agent_verification/ (three-lane gateway)
 docker-compose.yml     # NEW (Phase 1): all services, ports §1, named volumes
 ARCHITECTURE.md        # this file
 ```
@@ -672,6 +675,46 @@ new month lifts billing's suspension.
 (MCP client wrapper: `VouchClient(tenant_key, task_id)` injecting identity headers),
 5-minute quickstart: `docker-compose up` → deploy demo agent → watch live feed →
 export audit proof.
+
+### Phase 8 — agent verification: the demand-side gateway
+The supply side (Phases 1–7) signs and chains what agents *did*. Phase 8 answers
+what a *site* asks before serving an agent: "can you prove what you're allowed to
+do?" — passports for agents, not shields for sites.
+
+- **Credentials** (`services/verifier/credentials.py`): an agent credential binds
+  agent keypair + principal + delegation chain + authorization scope. Every
+  delegation link is signed by the *delegator's* Ed25519 key, so the chain
+  principal → agent → sub-agent verifies with public keys only — no shared
+  secrets (this is why Ed25519, not the tenant HMAC: HMAC can't verify a chain
+  without handing every delegator's secret to the site).
+- **Scope narrowing**: a delegate can never widen its delegator's scope
+  (allow-patterns ⊆ parent's, denies can only be added, numeric limits only
+  tighten); deny patterns always win. Expiry, replay nonces (±5 min skew),
+  proof-of-possession (agent signs the exact attempted action), and per-action
+  `max_per_day` limits are enforced.
+- **Verifier service** (`services/verifier/app.py`, `:9005`): `POST /v1/verify`
+  takes `{tenant_id, credential, action, nonce, ts, agent_signature}` and
+  returns `{decision, reason, lane, receipt_seq, receipt_hash}`. Every decision
+  — allow *and* deny — emits a signed, hash-chained receipt through the
+  existing `ReceiptEmitter` pipeline (receipt service when reachable, local
+  append-only file otherwise: the prototype's transparency log, verifiable
+  with `python3 -m gatekeeper.verify`).
+- **Three-lane gateway** (demo: `demo/agent_verification/`): the verified-agent
+  lane gets fast passage with per-principal daily rate limits; the human lane
+  passes unchanged (verifier never consulted); the unverified lane
+  (missing/forged credential) gets the status-quo challenge path.
+- **Vendored Ed25519** (`services/verifier/ed25519.py`): pure-Python,
+  cross-validated against libsodium in both directions (10 random seeds × 4
+  message lengths + pinned vectors + tamper rejection). Deliberately not a new
+  dependency: the repo stays stdlib (+ PyYAML, docker SDK).
+- **Trust root**: `VERIFIER_TRUSTED_ISSUERS` — the principal pubkeys a site
+  accepts credentials from. Trust is explicit, per site.
+
+**Exit:** `bash demo/agent_verification/run_demo.sh` green — human passes
+unchanged, good agent sails through with chained receipts, forged credential
+denied with reason, 12/12 bot-swarm requests challenged, transparency log
+verifies (`RECEIPTS VERIFIED`); `tests/test_agent_verification.py` green;
+full suite green.
 
 **Dependency order:** 1 → 2 → 3, then 4/5/6. Crew B phases 4–6 run **in parallel**
 with Crew A phases 1–3 against the frozen contracts + stubs.
