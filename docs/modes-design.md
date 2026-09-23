@@ -206,12 +206,16 @@ harmless — it can only ever authorize catalog actions.
   site owns that branching; Vouch supplies the trusted verdict. The 7
   frozen receipt-evidence fields are untouched; mode is read from the
   credential in the verifier response.
-- **Known integration gap (out of scope for this pass):** the reference
-  middleware's verifier client (`middleware.py::_VerifierClient.verify`)
-  rebuilds the POST body from the 6 core envelope fields and drops
-  `principal_approval`. Prepare-mode flows through the reference
-  middleware need that field forwarded (one-line follow-up). Flagged for
-  the reviewer; not changed here per the verifier-core-only scope.
+- **Integration gap CLOSED (2026-09-23):** the reference middleware's
+  verifier client (`middleware.py::_VerifierClient.verify`) rebuilt the
+  POST body from the 6 core envelope fields and dropped
+  `principal_approval`, so prepare-mode effect flows failed closed
+  end-to-end through it. The client now forwards `principal_approval`
+  verbatim when the agent attached one (the verifier — never the client —
+  checks its signature/binding/expiry/single-use). Covered by
+  `tests/test_h3_middleware_approval.py`: prepare → approval → execute
+  through the middleware over loopback HTTP reaches the agent lane; the
+  no-approval case still fails closed.
 
 ## 7. Ambiguities resolved (judgment calls)
 
