@@ -30,6 +30,8 @@ Pages (server-rendered HTML, no JS framework):
   GET /policies         viewer + editor (writes v2 schema, §5)
   GET /deployments      list + create + stop
   GET /keys             named keys: list/create/revoke + signing-key rotation
+  GET /demo             live three-lane gateway demo (drives a real demo
+                        backend: verifier + permit-office site on localhost)
 
 JSON APIs (same session auth; state-changing needs X-CSRF-Token):
   GET  /api/overview
@@ -37,6 +39,13 @@ JSON APIs (same session auth; state-changing needs X-CSRF-Token):
   GET  /api/receipts/<seq>
   GET  /api/verify                       -> receipt-service GET /v1/verify
   GET  /api/receipts/stream              -> SSE relay of /v1/receipts/stream
+  GET  /api/demo/status                  -> live demo backend health + lanes
+  POST /api/demo/provision               -> (re)boot the demo backend
+  POST /api/demo/run/good                -> signed agent request, live
+  POST /api/demo/run/human               -> plain form post, live
+  POST /api/demo/run/forged              -> tampered credential, live
+  POST /api/demo/run/swarm               -> credential-less bot swarm, live
+  POST /api/demo/run/verify-log          -> gatekeeper.verify on the live log
   GET  /api/policies                     PUT /api/policies/<task>
   DELETE /api/policies/<task>
   GET  /api/deployments  POST /api/deployments
@@ -59,6 +68,11 @@ Env:  DASHBOARD_PORT   (default 3000)
       RECEIPT_SVC_URL  (default http://127.0.0.1:9001)
       DASHBOARD_API_KEY (optional: single-operator mode, skips login)
       DASHBOARD_SESSION_TTL (seconds, default 43200 = 12h)
+      VOUCH_DEMO_STATE_DIR (default ./demo_state; demo keys + transparency log)
+      DEMO_VERIFIER_PORT (default 9005; demo verifier, 127.0.0.1 only)
+      DEMO_SITE_PORT     (default 9011; demo site, 127.0.0.1 only)
+      DEMO_SWARM_SIZE    (default 12 bots per swarm run)
+      DEMO_PROVISION_COOLDOWN_S (default 30; min seconds between provisions)
 """
 import html
 import json
@@ -72,6 +86,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from .upstream import fwd, UpstreamError
+from .demo_backend import get_demo_backend
 
 PORT = int(os.environ.get("DASHBOARD_PORT", "3000"))
 CONTROLPLANE_URL = os.environ.get("CONTROLPLANE_URL",
@@ -280,7 +295,7 @@ class Handler(BaseHTTPRequestHandler):
     def _nav(self, active, csrf=""):
         items = [("overview", "Overview"), ("receipts", "Receipts"),
                  ("policies", "Policies"), ("deployments", "Deployments"),
-                 ("keys", "API Keys")]
+                 ("keys", "API Keys"), ("demo", "Live demo")]
         links = " ".join(
             f'<a href="/{p}" class="{ "on" if p == active else ""}">{t}</a>'
             for p, t in items)
@@ -845,6 +860,175 @@ leaves the server (§10.5).</p></div>"""
             return self._redirect("/keys?error=" + quote(str(msg))[:200])
         self._redirect(f"/keys?rotated={quote(str(data.get('new_kid')))}")
 
+    # ------------------------------------------------------- live demo page
+    def _demo_page(self):
+        key = self._require_key_html()
+        if key is None:
+            return
+        csrf = self._page_csrf()
+        page = r"""<h2>Live demo &mdash; the verified-agent gateway</h2>
+<p><b>Proof layer for AI agents. Every action signed, chained, verifiable.</b></p>
+<p class="muted">This page drives a real demo stack on this machine: a
+verifier that checks signed agent credentials, and the &ldquo;Smallville
+Permit Office&rdquo; site serving three lanes &mdash; verified agents sail
+through, humans pass unchanged, everything else gets the challenge path.
+Press a button: every number below comes from a live call, never a mock.</p>
+
+<div class="card" id="backend-card">
+<h3>Demo backend <span id="backend-dot" class="muted">&bull;</span></h3>
+<div id="backend-status"><span class="muted">checking&hellip;</span></div>
+<p><button id="provision-btn">Start / reset the demo backend</button>
+<span id="provision-msg" class="muted"></span></p>
+<p class="muted">Reset mints fresh demo keys and reboots the verifier and the
+site. The backend binds 127.0.0.1 only; nothing leaves this machine.</p>
+</div>
+
+<div class="card">
+<h3>1 &mdash; The good agent <span class="muted">verified-agent lane</span></h3>
+<p>A legitimate agent presents a signed credential plus its delegation chain.
+The verifier checks signatures, chain integrity, scope, replay, and rate
+limits &mdash; then the request sails through, and the decision lands in the
+transparency log as a signed, hash-chained record.</p>
+<p><button class="run-btn" data-step="good">Run the good agent</button></p>
+<div id="result-good" class="muted">not run yet</div>
+</div>
+
+<div class="card">
+<h3>2 &mdash; The human <span class="muted">human lane</span></h3>
+<p>A plain browser form post, no credential. It passes through unchanged
+&mdash; the verifier is never consulted.</p>
+<p><button class="run-btn" data-step="human">File as a human</button></p>
+<div id="result-human" class="muted">not run yet</div>
+</div>
+
+<div class="card">
+<h3>3 &mdash; The forger <span class="muted">unverified lane</span></h3>
+<p>A tampered credential &mdash; the scope was widened after issuance, so the
+issuer&rsquo;s signature no longer matches. Denied with the reason shown, and
+sent to the challenge path instead of reaching the form.</p>
+<p><button class="run-btn" data-step="forged">Run the forger</button></p>
+<div id="result-forged" class="muted">not run yet</div>
+</div>
+
+<div class="card">
+<h3>4 &mdash; The bot swarm <span class="muted">unverified lane</span></h3>
+<p>Credential-less bots slam the agent endpoint. Each one gets the status-quo
+challenge instead of reaching the form.</p>
+<p><button class="run-btn" data-step="swarm">Release the bot swarm</button></p>
+<div id="result-swarm" class="muted">not run yet</div>
+</div>
+
+<div class="card">
+<h3>5 &mdash; The transparency log</h3>
+<p>Every allow <em>and</em> deny above becomes a signed, hash-chained record.
+Re-run the chain verification against the live log.</p>
+<p><button class="run-btn" data-step="verify-log">Verify the chain</button></p>
+<div id="result-verify-log" class="muted">not run yet</div>
+</div>
+
+<script>
+var CSRF = "__CSRF__";
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){
+  return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+async function call(method,path){
+  var r=await fetch(path,{method:method,headers:{"X-CSRF-Token":CSRF}});
+  return await r.json();
+}
+function showError(id,err){
+  document.getElementById("result-"+id).innerHTML=
+    '<div class="banner bad"><b>Failed:</b> '+esc(err)+"</div>";
+}
+function render(id,html){
+  document.getElementById("result-"+id).innerHTML=html;
+}
+function renderStep(step,d){
+  if(!d.ok){showError(step,d.error||"unknown error");return;}
+  if(step==="good"){
+    render(step,'<div class="banner ok"><b>HTTP 200 &mdash; accepted, '+
+      'verified-agent lane.</b><br>Verified-action record: seq <code>'+
+      esc(d.receipt_seq)+'</code>, hash <code>'+
+      esc(String(d.receipt_hash||"").slice(0,16))+'&hellip;</code><br>'+
+      '<span class="muted">'+esc(d.message||"")+"</span></div>");
+  }else if(step==="human"){
+    render(step,'<div class="banner ok"><b>HTTP 200 &mdash; accepted, human '+
+      'lane.</b><br><span class="muted">'+esc(d.message||"")+"</span></div>");
+  }else if(step==="forged"){
+    render(step,'<div class="banner bad"><b>HTTP 429 &mdash; denied, '+
+      'unverified lane.</b><br>Reason: <code>'+esc(d.reason)+
+      '</code><br><span class="muted">Sent to the challenge path instead of '+
+      "reaching the form.</span></div>");
+  }else if(step==="swarm"){
+    render(step,'<div class="banner '+(d.challenged===d.total?"ok":"bad")+
+      '"><b>'+esc(d.challenged)+"/"+esc(d.total)+' challenged.</b><br>'+
+      '<span class="muted">'+esc(d.message||"")+"</span></div>");
+  }else if(step==="verify-log"){
+    render(step,'<div class="banner '+(d.chain_ok?"ok":"bad")+'"><b>'+
+      (d.chain_ok?"Chain intact":"CHAIN BROKEN")+"</b> &mdash; "+
+      esc(d.receipts)+" records replayed, all signatures valid.<br><code>"+
+      esc(d.output)+"</code></div>");
+  }
+}
+async function refreshStatus(){
+  var s=null;
+  try{s=await call("GET","/api/demo/status");}catch(e){s=null;}
+  var box=document.getElementById("backend-status");
+  var dot=document.getElementById("backend-dot");
+  var btns=document.querySelectorAll(".run-btn");
+  function lock(msg){
+    dot.textContent="\u25cf";dot.style.color="#c00";
+    btns.forEach(function(b){b.disabled=true;});
+    box.innerHTML='<div class="banner bad"><b>Demo backend unreachable.</b> '+
+      esc(msg)+"</div>";
+  }
+  if(!s||!s.ok){lock("The dashboard cannot reach its own status endpoint.");
+    return;}
+  var ready=s.provisioned&&s.verifier_up&&s.site_up;
+  dot.textContent="\u25cf";dot.style.color=ready?"#0a7d2c":"#c00";
+  btns.forEach(function(b){b.disabled=!ready;});
+  var lanes=s.lanes||{};
+  var html='<table style="max-width:560px"><tr><th>lane</th><th>hits</th></tr>'+
+    "<tr><td>verified-agent</td><td><b>"+esc(lanes["verified-agent"])+"</b></td></tr>"+
+    "<tr><td>human</td><td><b>"+esc(lanes.human)+"</b></td></tr>"+
+    "<tr><td>unverified</td><td><b>"+esc(lanes.unverified)+"</b></td></tr>"+
+    "</table><p class=\"muted\">"+esc(s.receipts)+
+    " records in the transparency log &middot; "+
+    esc(s.outstanding_challenges)+" outstanding challenges</p>";
+  if(!ready){
+    html='<div class="banner bad"><b>Demo backend unreachable.</b> Press '+
+      "&ldquo;Start / reset the demo backend&rdquo; to boot a fresh one.</div>"+html;
+  }
+  box.innerHTML=html;
+}
+document.querySelectorAll(".run-btn").forEach(function(b){
+  b.addEventListener("click",async function(){
+    var step=b.getAttribute("data-step");
+    render(step,'<span class="muted">running&hellip;</span>');
+    b.disabled=true;
+    try{
+      var d=await call("POST","/api/demo/run/"+step);
+      renderStep(step,d);
+    }catch(e){showError(step,"request failed: "+e);}
+    b.disabled=false;
+    refreshStatus();
+  });
+});
+document.getElementById("provision-btn").addEventListener("click",
+  async function(){
+    var btn=this,msg=document.getElementById("provision-msg");
+    btn.disabled=true;msg.textContent="provisioning\u2026";
+    try{
+      var d=await call("POST","/api/demo/provision");
+      msg.textContent=d.ok?d.message:("failed: "+(d.error||"unknown"));
+    }catch(e){msg.textContent="request failed: "+e;}
+    btn.disabled=false;
+    refreshStatus();
+  });
+refreshStatus();
+setInterval(refreshStatus,5000);
+</script>"""
+        page = page.replace("__CSRF__", esc(csrf))
+        self._send_html(200, self._page("Live demo", "demo", page))
+
     # --------------------------------------------------------------- JSON API
     def _api_overview(self, key):
         out = {}
@@ -897,6 +1081,24 @@ leaves the server (§10.5).</p></div>"""
         if r == "csrf" and method == "GET" and len(parts) == 1:
             s = self._session()
             return self._send(200, {"csrf_token": s["csrf"] if s else ""})
+        if r == "demo":
+            # Live three-lane gateway demo. The demo backend is separate
+            # from the tenant's real services; the tenant key is the auth
+            # gate only and is never handed to the demo stack.
+            db = get_demo_backend()
+            if len(parts) == 2 and parts[1] == "status" and method == "GET":
+                return self._send(200, db.status())
+            if len(parts) == 2 and parts[1] == "provision" and \
+                    method == "POST":
+                return self._send(200, db.provision())
+            if len(parts) == 3 and parts[1] == "run" and method == "POST":
+                step = parts[2]
+                fn = {"good": db.run_good, "human": db.run_human,
+                      "forged": db.run_forged, "swarm": db.run_swarm,
+                      "verify-log": db.verify_log}.get(step)
+                if fn is None:
+                    return self._err(404, "not_found")
+                return self._send(200, fn())
         if r == "receipts":
             if len(parts) == 1 and method == "GET":
                 return relay(RECEIPT_SVC_URL, "/v1/receipts", params={
@@ -1028,6 +1230,8 @@ leaves the server (§10.5).</p></div>"""
             return self._deployments(q)
         if path == "/keys":
             return self._keys(q)
+        if path == "/demo":
+            return self._demo_page()
         self._send_html(404, self._page("Not found", None,
                                        "<p>Unknown page.</p>"))
 

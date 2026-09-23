@@ -35,6 +35,14 @@ One command, no Docker, no network beyond localhost, no cloud spend. It:
 6. prints lane counters and verifies the transparency log
    (`RECEIPTS VERIFIED: chain intact, all signatures valid`).
 
+## Interactive version (dashboard)
+
+The same story, clickable: the dashboard's **Live demo** page (`/demo`,
+`web/dashboard/demo_backend.py`) provisions a fresh demo backend on demand
+and lets a visitor trigger each lane against the real verifier + site —
+every number shown comes from a live call. See `tests/test_demo_page.py`
+for the end-to-end proof.
+
 ## Pieces
 
 - `site.py` — the gateway: form page, agent endpoint, challenge path.
