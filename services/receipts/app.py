@@ -8,6 +8,13 @@ Endpoints (§4.2, §4.6):
     POST /v1/ingest                  service token
       201 {"tenant_id","seq","hash"} | 409 {"error":"duplicate_seq"}
       | 422 {"error":"chain_break","expected_prev_hash",...}
+      | 422 {"error":"bad_signature"} — the chain hash was recomputed and
+        the HMAC verified at ingest (H-1); forgeries are rejected and
+        never stored
+      | 404 {"error":"unknown_tenant"} — fail closed when the key
+        authority knows no keys for the tenant
+      | 503 {"error":"key_authority_unavailable"} — control plane
+        unreachable and no local fallback knows the tenant
     GET  /v1/receipts?task_id=&tool=&decision=&agent_id=&limit=&cursor=&order=
          service token (tenant_id required) or tenant API key (scoped to its
          tenant; ?tenant_id= optional, must match)
@@ -50,7 +57,7 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from .store import ReceiptStore, ChainBreak, DuplicateSeq
+from .store import ReceiptStore, ChainBreak, DuplicateSeq, SignatureRejected
 from . import keys as keys_module
 from .keys import load_verification_keys, KeyAuthorityUnavailable
 
@@ -398,8 +405,29 @@ class Handler(BaseHTTPRequestHandler):
         if body["decision"] not in ("allow", "deny"):
             return self._err(400, "invalid_receipt",
                              "decision must be 'allow' or 'deny'")
+        # H-1: authenticate the receipt at the trust boundary, before the
+        # store touches it. The key authority (control plane, or the local
+        # tenants.json fallback) supplies the tenant's verification keys;
+        # fail closed on an unknown tenant or an unreachable authority.
         try:
-            stored = self.store.ingest(body)
+            keys = load_verification_keys(self.tenants_path,
+                                          body["tenant_id"],
+                                          self.controlplane_url, self.cp_token)
+        except KeyAuthorityUnavailable as e:
+            return self._err(503, "key_authority_unavailable", str(e))
+        except (KeyError, FileNotFoundError, ValueError) as e:
+            return self._err(404, "unknown_tenant", str(e))
+        try:
+            stored = self.store.ingest(body, keys)
+        except SignatureRejected as e:
+            # Forged receipt: hash mismatch, bad HMAC, or unknown kid.
+            # Nothing was stored; the attempt never touches usage counts.
+            return self._send(422, {
+                "error": "bad_signature",
+                "message": f"receipt failed ingest verification: {e.reason}",
+                "tenant_id": body["tenant_id"],
+                "seq": body["seq"],
+            })
         except DuplicateSeq:
             return self._err(409, "duplicate_seq",
                              f"seq {body['seq']} already stored for tenant "

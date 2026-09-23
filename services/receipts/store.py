@@ -83,6 +83,89 @@ class DuplicateSeq(Exception):
     pass
 
 
+class SignatureRejected(Exception):
+    """A receipt failed ingest-time cryptographic verification.
+
+    reason: "no_keys" (no verification keys supplied / unknown tenant) |
+            "unknown_key" (receipt's kid not in the tenant's key set) |
+            "malformed" (hash/sig/prev_hash missing or not strings) |
+            "hash_mismatch" (body tampered: recomputed hash != presented) |
+            "bad_signature" (HMAC does not verify against the kid's key).
+    Nothing is stored when this is raised.
+    """
+    def __init__(self, reason):
+        super().__init__(f"signature rejected: {reason}")
+        self.reason = reason
+
+
+# Fields that are store-side bookkeeping, never part of the signed body.
+# (v1_seq/ingested_at are assigned by the store; hash/sig are the values
+# being verified, not inputs.)
+_UNSIGNED_FIELDS = ("hash", "sig", "ingested_at", "v1_seq")
+
+
+def canonical_body(record):
+    """The signed body of a receipt record.
+
+    Everything the gatekeeper's build_receipt() hashed and HMACed, minus
+    the hash/sig being verified and minus store-side bookkeeping. Single
+    canonicalization point shared by ingest verification and
+    verify_tenant() — they must byte-match the signer.
+    """
+    return {k: v for k, v in record.items() if k not in _UNSIGNED_FIELDS}
+
+
+def record_hash(prev_hash, body):
+    """Recompute the chain hash: sha256(prev_hash || canonical_json(body))."""
+    return hashlib.sha256(
+        prev_hash.encode("utf-8")
+        + json.dumps(body, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def record_sig(key, body, hash_hex):
+    """Recompute the HMAC over canonical_json(body || hash)."""
+    return hmac.new(
+        key,
+        json.dumps({**body, "hash": hash_hex}, sort_keys=True).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def verify_receipt_crypto(receipt, keys):
+    """Verify a receipt's hash and HMAC before storage (H-1).
+
+    keys: {kid: key_bytes} — the tenant's full verification key set
+    (kid-pinned, so in-flight receipts still verify across a rotation).
+    The caller loads these from the key authority; this function never
+    touches the network.
+
+    Fail closed: missing keys, an unknown kid, a malformed envelope, a
+    hash mismatch, or a bad HMAC all raise SignatureRejected. Returns
+    None on success.
+    """
+    if not keys:
+        raise SignatureRejected("no_keys")
+    kid = receipt.get("kid")
+    key = keys.get(kid) if kid else None
+    if key is None:
+        raise SignatureRejected("unknown_key")
+    prev_hash = receipt.get("prev_hash")
+    presented_hash = receipt.get("hash")
+    presented_sig = receipt.get("sig")
+    if not all(isinstance(v, str)
+               for v in (prev_hash, presented_hash, presented_sig)):
+        raise SignatureRejected("malformed")
+    body = canonical_body(receipt)
+    if not hmac.compare_digest(presented_hash,
+                               record_hash(prev_hash, body)):
+        raise SignatureRejected("hash_mismatch")
+    if not hmac.compare_digest(presented_sig,
+                               record_sig(key, body, presented_hash)):
+        raise SignatureRejected("bad_signature")
+    return None
+
+
 class ReceiptStore:
     """Thread-safe SQLite receipt store."""
 
@@ -97,8 +180,17 @@ class ReceiptStore:
             self._db.commit()
 
     # ------------------------------------------------------------ ingest
-    def ingest(self, receipt):
+    def ingest(self, receipt, keys):
         """Store one gatekeeper-signed receipt.
+
+        H-1: the receipt is cryptographically verified BEFORE anything is
+        stored — the chain hash is recomputed over the canonical body and
+        the HMAC is verified against the tenant's verification keys.
+        Raises SignatureRejected (nothing stored) on any mismatch.
+
+        keys: {kid: key_bytes} for receipt["tenant_id"], loaded by the
+        caller from the key authority (services/receipts/keys.py). Fail
+        closed: missing keys or an unknown tenant reject the receipt.
 
         Returns the stored row dict. Raises DuplicateSeq if (tenant_id, seq)
         already exists, ChainBreak(expected_seq, expected_prev_hash) if the
@@ -113,6 +205,9 @@ class ReceiptStore:
             )
             if cur.fetchone():
                 raise DuplicateSeq()
+            # Authenticate before chain-position checks: a forged receipt
+            # is rejected on crypto alone, regardless of seq/prev_hash.
+            verify_receipt_crypto(receipt, keys)
             tip = self._db.execute(
                 "SELECT seq, hash FROM receipts WHERE tenant_id=? "
                 "ORDER BY seq DESC LIMIT 1",
@@ -263,13 +358,12 @@ class ReceiptStore:
                 body = {k: r[k] for k in self._V1_BODY_KEYS}
                 body["seq"] = r["v1_seq"]
             else:
-                body = {k: v for k, v in r.items()
-                        if k not in ("hash", "sig", "ingested_at", "v1_seq")}
-            want_hash = hashlib.sha256(
-                r["prev_hash"].encode("utf-8")
-                + json.dumps(body, sort_keys=True).encode("utf-8")
-            ).hexdigest()
-            if r["hash"] != want_hash:
+                # Same canonicalization as ingest-time verification (H-1):
+                # one code path means the read-path check and the
+                # trust-boundary check can never drift apart.
+                body = canonical_body(r)
+            if not hmac.compare_digest(r["hash"],
+                                       record_hash(r["prev_hash"], body)):
                 failures.append({"seq": seq,
                                  "error": "hash mismatch (tampered body?)"})
             kid = r.get("kid")
@@ -277,15 +371,9 @@ class ReceiptStore:
             if key is None:
                 failures.append({"seq": seq,
                                  "error": f"unknown key id '{kid}'"})
-            else:
-                want_sig = hmac.new(
-                    key,
-                    json.dumps({**body, "hash": r["hash"]},
-                               sort_keys=True).encode("utf-8"),
-                    hashlib.sha256,
-                ).hexdigest()
-                if not hmac.compare_digest(want_sig, r["sig"]):
-                    failures.append({"seq": seq, "error": "bad signature"})
+            elif not hmac.compare_digest(r["sig"],
+                                         record_sig(key, body, r["hash"])):
+                failures.append({"seq": seq, "error": "bad signature"})
             prev_hash = r["hash"]
         return (len(failures) == 0), failures
 

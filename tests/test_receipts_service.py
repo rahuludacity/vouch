@@ -23,6 +23,15 @@ sys.path.insert(0, REPO)
 
 from services.receipts import app as appmod  # noqa: E402
 from services.receipts.store import ReceiptStore  # noqa: E402
+try:
+    # SignatureRejected exists only with the H-1 fix. The fallback keeps
+    # this module importable on pre-fix code so the regression tests fail
+    # on behavior (not at collection) when the fix is stashed for the
+    # fail-without-fix proof below.
+    from services.receipts.store import SignatureRejected  # noqa: E402
+except ImportError:  # pragma: no cover - pre-fix code only
+    class SignatureRejected(Exception):  # noqa: D101
+        """Placeholder; never raised by pre-fix code."""
 from services.receipts.keys import load_verification_keys  # noqa: E402
 from services.receipts import import_v1  # noqa: E402
 from gatekeeper.receipts import build_receipt  # noqa: E402 (crypto only, no proxy)
@@ -178,6 +187,101 @@ class ServiceTest(unittest.TestCase):
         code, resp = self.request("POST", "/v1/ingest", r)
         self.assertEqual(code, 400)
 
+    # --------------------------------- H-1: ingest-time crypto verification
+    def _ensure_tenant(self, tenant_id, key_hex=KEY_HEX):
+        """Add a tenant to the service's tenants file.
+
+        The service reads the file fresh on every ingest (no cache on the
+        file path), so tenants created mid-test take effect immediately.
+        """
+        with open(TENANTS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if tenant_id not in data["tenants"]:
+            data["tenants"][tenant_id] = {
+                "created_at": 1, "keys": {"k1": key_hex}, "current_kid": "k1"}
+            with open(TENANTS_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+
+    def _next_for(self, tenant, **kw):
+        """Build the next receipt for a tenant tracked outside self.tip."""
+        seq, prev = self.tip.get(tenant, (0, None))
+        seq += 1
+        prev = prev or "GENESIS"
+        return make_receipt(tenant, seq, prev, **kw), seq, prev
+
+    def test_ingest_rejects_tampered_body(self):
+        # H-1(1): tampered body with the ORIGINAL signature -> REJECTED,
+        # never stored. A bearer-token holder cannot rewrite history.
+        tenant = "sigtest_tamper"
+        self._ensure_tenant(tenant)
+        r, seq, _ = self._next_for(tenant)
+        forged = dict(r)
+        forged["tool"] = "evil_tool"  # body changed, sig+hash are original
+        code, resp = self.request("POST", "/v1/ingest", forged)
+        self.assertEqual(code, 422)
+        self.assertEqual(resp["error"], "bad_signature")
+        # nothing stored: the seq is still free and the tenant is empty
+        code, _ = self.request(
+            "GET", f"/v1/receipts/{seq}?tenant_id={tenant}")
+        self.assertEqual(code, 404)
+        code, resp = self.request("GET", f"/v1/verify?tenant_id={tenant}")
+        self.assertEqual(resp["receipts"], 0)
+        # the untampered original still ingests fine afterwards
+        code, resp = self.request("POST", "/v1/ingest", r)
+        self.assertEqual(code, 201, resp)
+        self.tip[tenant] = (seq, r["hash"])
+
+    def test_ingest_rejects_wrong_key_signature(self):
+        # H-1(2): valid body, but the HMAC was made with a DIFFERENT key
+        # (same kid) -> REJECTED. Cross-key forgery fails the HMAC check,
+        # not just the kid lookup.
+        tenant = "sigtest_wrongkey"
+        self._ensure_tenant(tenant)
+        _, seq, prev = self._next_for(tenant)
+        other_key = hashlib.sha256(b"attacker-key-not-the-tenant-key").digest()
+        forged = build_receipt(
+            seq=seq, prev_hash=prev, tenant_id=tenant, kid="k1",
+            key=other_key, task_id="deploy-staging", agent_id="agent-001",
+            tool="read_file", args={"path": "x"}, decision="allow",
+            reason=None, rule_id="v1-read_file", policy_version=1)
+        code, resp = self.request("POST", "/v1/ingest", forged)
+        self.assertEqual(code, 422)
+        self.assertEqual(resp["error"], "bad_signature")
+        code, _ = self.request(
+            "GET", f"/v1/receipts/{seq}?tenant_id={tenant}")
+        self.assertEqual(code, 404)
+
+    def test_ingest_accepts_valid_record_chain_intact(self):
+        # H-1(3): a fully valid receipt is accepted, retrievable, and the
+        # chain verifies end to end.
+        tenant = "sigtest_valid"
+        self._ensure_tenant(tenant)
+        r, seq, _ = self._next_for(tenant)
+        code, resp = self.request("POST", "/v1/ingest", r)
+        self.assertEqual(code, 201, resp)
+        self.tip[tenant] = (seq, r["hash"])
+        code, got = self.request(
+            "GET", f"/v1/receipts/{seq}?tenant_id={tenant}")
+        self.assertEqual(code, 200)
+        self.assertEqual(got["hash"], r["hash"])
+        self.assertEqual(got["sig"], r["sig"])
+        # a second valid receipt continues the chain
+        r2, seq2, _ = self._next_for(tenant)
+        code, resp = self.request("POST", "/v1/ingest", r2)
+        self.assertEqual(code, 201, resp)
+        self.tip[tenant] = (seq2, r2["hash"])
+        code, resp = self.request("GET", f"/v1/verify?tenant_id={tenant}")
+        self.assertEqual(code, 200)
+        self.assertTrue(resp["chain_ok"], resp["failures"])
+        self.assertEqual(resp["receipts"], 2)
+
+    def test_ingest_rejects_unknown_tenant(self):
+        # H-1 fail closed: the key authority knows no keys for "ghost".
+        r = make_receipt("ghost", 1, "GENESIS")
+        code, resp = self.request("POST", "/v1/ingest", r)
+        self.assertEqual(code, 404)
+        self.assertEqual(resp["error"], "unknown_tenant")
+
     def test_query_filters_and_pagination(self):
         self.ingest_next(tool="tool_a", task_id="t1")
         self.ingest_next(tool="tool_b", task_id="t1")
@@ -287,6 +391,70 @@ class ServiceTest(unittest.TestCase):
             self.assertEqual(last["hash"], live["hash"])
         finally:
             stop.set()
+
+
+class StoreIngestVerificationTest(unittest.TestCase):
+    """H-1 at the store boundary: keys are mandatory, forgeries rejected.
+
+    No HTTP server: proves ReceiptStore.ingest() itself refuses to store
+    unverifiable receipts, whatever the caller is.
+    """
+
+    def setUp(self):
+        self.db = os.path.join(TMP, f"h1-{time.time_ns()}.db")
+        self.store = ReceiptStore(self.db)
+        self.keys = {"k1": KEY}
+
+    def tearDown(self):
+        self.store.close()
+
+    def test_ingest_requires_keys(self):
+        # fail closed: keys are a required argument, and empty/None
+        # key sets reject instead of skipping verification.
+        r = make_receipt("acme", 1, "GENESIS")
+        with self.assertRaises(TypeError):
+            self.store.ingest(r)
+        with self.assertRaises(SignatureRejected) as cm:
+            self.store.ingest(r, None)
+        self.assertEqual(cm.exception.reason, "no_keys")
+        with self.assertRaises(SignatureRejected):
+            self.store.ingest(r, {})
+        self.assertEqual(self.store.count("acme"), 0)
+
+    def test_ingest_rejects_unknown_kid(self):
+        r = make_receipt("acme", 1, "GENESIS")
+        r["kid"] = "k9"  # no such key id for this tenant
+        with self.assertRaises(SignatureRejected) as cm:
+            self.store.ingest(r, self.keys)
+        self.assertEqual(cm.exception.reason, "unknown_key")
+        self.assertEqual(self.store.count("acme"), 0)
+
+    def test_ingest_rejects_tampered_body(self):
+        r = make_receipt("acme", 1, "GENESIS")
+        r["decision"] = "deny"  # body changed, original hash+sig
+        with self.assertRaises(SignatureRejected) as cm:
+            self.store.ingest(r, self.keys)
+        self.assertEqual(cm.exception.reason, "hash_mismatch")
+        self.assertEqual(self.store.count("acme"), 0)
+
+    def test_ingest_rejects_bad_signature(self):
+        # hash matches the body, so this isolates the HMAC check.
+        r = make_receipt("acme", 1, "GENESIS")
+        r["sig"] = "0" * 64
+        with self.assertRaises(SignatureRejected) as cm:
+            self.store.ingest(r, self.keys)
+        self.assertEqual(cm.exception.reason, "bad_signature")
+        self.assertEqual(self.store.count("acme"), 0)
+
+    def test_valid_ingest_stores_and_chains(self):
+        r1 = make_receipt("acme", 1, "GENESIS")
+        stored = self.store.ingest(r1, self.keys)
+        self.assertEqual(stored["seq"], 1)
+        self.assertEqual(stored["hash"], r1["hash"])
+        r2 = make_receipt("acme", 2, r1["hash"])
+        self.store.ingest(r2, self.keys)
+        ok, failures = self.store.verify_tenant("acme", self.keys)
+        self.assertTrue(ok, failures)
 
 
 class ImportV1Test(unittest.TestCase):
@@ -410,9 +578,10 @@ class ImportV1Test(unittest.TestCase):
                 os.remove(p)
         self._write_v1_ledger(ledger, n_per_tenant=1)
         store = ReceiptStore(db)
-        # pre-existing v2 row for acme
+        # pre-existing v2 row for acme (H-1: ingest takes the tenant's
+        # verification keys and verifies hash + HMAC before storing)
         r = make_receipt("acme", 1, "GENESIS")
-        store.ingest(r)
+        store.ingest(r, load_verification_keys(TENANTS_PATH, "acme"))
         store.close()
         rc = import_v1.main(["--db", db, "--ledger", ledger,
                              "--tenants", TENANTS_PATH,
