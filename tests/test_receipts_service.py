@@ -5,6 +5,7 @@ Spins up the real receipt service app in-process on an ephemeral port.
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -15,7 +16,7 @@ import socket
 import urllib.parse
 import urllib.request
 import urllib.error
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -33,6 +34,7 @@ except ImportError:  # pragma: no cover - pre-fix code only
     class SignatureRejected(Exception):  # noqa: D101
         """Placeholder; never raised by pre-fix code."""
 from services.receipts.keys import load_verification_keys  # noqa: E402
+from services.receipts import keys as keys_module  # noqa: E402
 from services.receipts import import_v1  # noqa: E402
 from gatekeeper.receipts import build_receipt  # noqa: E402 (crypto only, no proxy)
 
@@ -41,22 +43,24 @@ TENANTS_PATH = os.path.join(TMP, "tenants.json")
 DB_PATH = os.path.join(TMP, "receipts.db")
 TOKEN = "test-svc-token"
 
-# deterministic test key (never a real secret)
+# deterministic test keys (never real secrets)
 KEY_HEX = hashlib.sha256(b"vouch-test-tenant-key").hexdigest()
 KEY = bytes.fromhex(KEY_HEX)
+KEY2_HEX = hashlib.sha256(b"vouch-test-tenant-key-2").hexdigest()
+KEY2 = bytes.fromhex(KEY2_HEX)
 
 with open(TENANTS_PATH, "w", encoding="utf-8") as f:
     json.dump({"tenants": {"acme": {"created_at": 1, "keys": {"k1": KEY_HEX},
                                    "current_kid": "k1"}}}, f)
 
 
-def make_receipt(tenant_id, seq, prev_hash, **kw):
+def make_receipt(tenant_id, seq, prev_hash, kid="k1", key=KEY, **kw):
     r = dict(tenant_id=tenant_id, task_id="deploy-staging", agent_id="agent-001",
              tool="read_file", args={"path": "x"}, decision="allow",
              reason=None, rule_id="v1-read_file", policy_version=1)
     r.update(kw)
     return build_receipt(seq=seq, prev_hash=prev_hash, tenant_id=tenant_id,
-                         kid="k1", key=KEY, task_id=r["task_id"],
+                         kid=kid, key=key, task_id=r["task_id"],
                          agent_id=r["agent_id"], tool=r["tool"], args=r["args"],
                          decision=r["decision"], reason=r["reason"],
                          rule_id=r["rule_id"],
@@ -455,6 +459,104 @@ class StoreIngestVerificationTest(unittest.TestCase):
         self.store.ingest(r2, self.keys)
         ok, failures = self.store.verify_tenant("acme", self.keys)
         self.assertTrue(ok, failures)
+
+
+class _FakeCPHandler(BaseHTTPRequestHandler):
+    """Minimal control-plane stub: GET /internal/tenants/{id}/keys."""
+    keys_response = {}  # tenant_id -> {"keys": {kid: key_hex}}
+
+    def do_GET(self):
+        m = re.match(r"^/internal/tenants/([^/]+)/keys$", self.path)
+        if m and m.group(1) in self.keys_response:
+            body = json.dumps(self.keys_response[m.group(1)]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
+class IngestRotationRaceTest(unittest.TestCase):
+    """H-1 rotation race: the control-plane key cache (5 min TTL) can
+    predate a key rotation while the gatekeeper already signs with the
+    new kid. Ingest must refresh once and accept the genuine receipt —
+    not drop it, and not accept a truly unknown kid."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._saved = {a: getattr(appmod.Handler, a) for a in (
+            "store", "tenants_path", "svc_token",
+            "controlplane_url", "cp_token")}
+        cls.cp = ThreadingHTTPServer(("127.0.0.1", 0), _FakeCPHandler)
+        threading.Thread(target=cls.cp.serve_forever, daemon=True).start()
+        cp_url = ("http://127.0.0.1:%d"
+                  % cls.cp.socket.getsockname()[1])
+        cls.db = os.path.join(TMP, f"race-{time.time_ns()}.db")
+        cls.tenants_path = os.path.join(TMP, f"race-{time.time_ns()}.json")
+        with open(cls.tenants_path, "w", encoding="utf-8") as f:
+            json.dump({"tenants": {}}, f)
+        cls.store = ReceiptStore(cls.db)
+        appmod.Handler.store = cls.store
+        appmod.Handler.tenants_path = cls.tenants_path
+        appmod.Handler.svc_token = TOKEN
+        appmod.Handler.controlplane_url = cp_url
+        appmod.Handler.cp_token = "cp-test-token"
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), appmod.Handler)
+        cls.base = ("http://127.0.0.1:%d"
+                    % cls.server.socket.getsockname()[1])
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.store.close()
+        for attr, val in cls._saved.items():
+            setattr(appmod.Handler, attr, val)
+        keys_module._cp_cache.pop("acme", None)
+        cls.server.shutdown()
+        cls.cp.shutdown()
+
+    def _ingest(self, receipt):
+        data = json.dumps(receipt).encode()
+        req = urllib.request.Request(
+            self.base + "/v1/ingest", data=data, method="POST",
+            headers={"Authorization": f"Bearer {TOKEN}",
+                     "Content-Type": "application/json"})
+        try:
+            resp = urllib.request.urlopen(req, timeout=10)
+            return resp.status, json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def test_new_kid_accepted_after_one_cache_refresh(self):
+        # Rotation happened: the CP knows k1+k2, but the service cache
+        # is stale (k1 only). The k2-signed receipt must be accepted
+        # after the single refresh — not dropped as a forgery.
+        _FakeCPHandler.keys_response = {
+            "race1": {"keys": {"k1": KEY_HEX, "k2": KEY2_HEX}}}
+        keys_module._cp_cache["race1"] = ({"k1": KEY}, time.time())
+        r = make_receipt("race1", 1, "GENESIS", kid="k2", key=KEY2)
+        code, body = self._ingest(r)
+        self.assertEqual(code, 201, body)
+        self.assertEqual(self.store.count("race1"), 1)
+        # the refresh stuck: k2 is in the cache now
+        self.assertIn("k2", keys_module._cp_cache["race1"][0])
+
+    def test_truly_unknown_kid_still_rejected_after_refresh(self):
+        # k9 is not a rotation — the CP never heard of it. The retry
+        # must still fail closed with 422 and store nothing.
+        _FakeCPHandler.keys_response = {"race2": {"keys": {"k1": KEY_HEX}}}
+        keys_module._cp_cache.pop("race2", None)
+        r = make_receipt("race2", 1, "GENESIS", kid="k9", key=KEY2)
+        code, body = self._ingest(r)
+        self.assertEqual(code, 422, body)
+        self.assertEqual(body["error"], "bad_signature")
+        self.assertEqual(self.store.count("race2"), 0)
 
 
 class ImportV1Test(unittest.TestCase):

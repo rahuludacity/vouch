@@ -409,36 +409,51 @@ class Handler(BaseHTTPRequestHandler):
         # store touches it. The key authority (control plane, or the local
         # tenants.json fallback) supplies the tenant's verification keys;
         # fail closed on an unknown tenant or an unreachable authority.
-        try:
-            keys = load_verification_keys(self.tenants_path,
-                                          body["tenant_id"],
-                                          self.controlplane_url, self.cp_token)
-        except KeyAuthorityUnavailable as e:
-            return self._err(503, "key_authority_unavailable", str(e))
-        except (KeyError, FileNotFoundError, ValueError) as e:
-            return self._err(404, "unknown_tenant", str(e))
-        try:
-            stored = self.store.ingest(body, keys)
-        except SignatureRejected as e:
-            # Forged receipt: hash mismatch, bad HMAC, or unknown kid.
-            # Nothing was stored; the attempt never touches usage counts.
-            return self._send(422, {
-                "error": "bad_signature",
-                "message": f"receipt failed ingest verification: {e.reason}",
-                "tenant_id": body["tenant_id"],
-                "seq": body["seq"],
-            })
-        except DuplicateSeq:
-            return self._err(409, "duplicate_seq",
-                             f"seq {body['seq']} already stored for tenant "
-                             f"'{body['tenant_id']}'")
-        except ChainBreak as e:
-            return self._send(422, {
-                "error": "chain_break",
-                "message": "receipt does not continue the tenant tip",
-                "expected_seq": e.expected_seq,
-                "expected_prev_hash": e.expected_prev_hash,
-            })
+        #
+        # Rotation race: the control-plane key cache (5 min TTL) can
+        # predate a key rotation while the gatekeeper already signs with
+        # the new kid. On an unknown_key rejection with a control plane
+        # configured, invalidate the cache and retry exactly once with
+        # fresh keys — a genuine post-rotation receipt must not be
+        # dropped. Every other outcome still fails closed.
+        stored = None
+        for attempt in (1, 2):
+            try:
+                keys = load_verification_keys(self.tenants_path,
+                                              body["tenant_id"],
+                                              self.controlplane_url,
+                                              self.cp_token)
+            except KeyAuthorityUnavailable as e:
+                return self._err(503, "key_authority_unavailable", str(e))
+            except (KeyError, FileNotFoundError, ValueError) as e:
+                return self._err(404, "unknown_tenant", str(e))
+            try:
+                stored = self.store.ingest(body, keys)
+                break
+            except SignatureRejected as e:
+                if (e.reason == "unknown_key" and self.controlplane_url
+                        and attempt == 1):
+                    keys_module.invalidate_cache(body["tenant_id"])
+                    continue
+                # Forged receipt: hash mismatch, bad HMAC, or unknown kid.
+                # Nothing was stored; the attempt never touches usage counts.
+                return self._send(422, {
+                    "error": "bad_signature",
+                    "message": f"receipt failed ingest verification: {e.reason}",
+                    "tenant_id": body["tenant_id"],
+                    "seq": body["seq"],
+                })
+            except DuplicateSeq:
+                return self._err(409, "duplicate_seq",
+                                 f"seq {body['seq']} already stored for tenant "
+                                 f"'{body['tenant_id']}'")
+            except ChainBreak as e:
+                return self._send(422, {
+                    "error": "chain_break",
+                    "message": "receipt does not continue the tenant tip",
+                    "expected_seq": e.expected_seq,
+                    "expected_prev_hash": e.expected_prev_hash,
+                })
         self._publish(stored)
         return self._send(201, {"tenant_id": stored["tenant_id"],
                                "seq": stored["seq"], "hash": stored["hash"]})
