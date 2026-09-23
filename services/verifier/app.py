@@ -262,9 +262,15 @@ def _decide_v2(req, now, tenant_id, cred, action, atype):
 
     # Spending ceiling: atomic check+increment (no TOCTOU). The verifier
     # already read-checked the ceiling; this is the authoritative gate.
+    # H-2: never treat an absent ceiling as unlimited when the delegation
+    # chain implies one — fail closed. (v2 already denies this above; this
+    # is the gate's own invariant.)
     amount = action.get("amount_cents") or 0
     lim = (credentials._norm_scope(cred.get("scope"))
            .get("limits", {}).get(atype, {}))
+    ok_cl, why_cl = credentials.check_chain_limits_present(cred, atype)
+    if not ok_cl:
+        return ("deny", "; ".join(why_cl), "unverified", cred, None)
     ceiling = lim.get("max_spend_per_day")
     if amount and ceiling is not None:
         ok_spend, used_cents = STATE.check_and_add_spending(

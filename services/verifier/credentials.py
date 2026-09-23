@@ -121,18 +121,97 @@ def scope_allows(scope, action_type):
 
 
 def scope_narrows(child, parent):
-    """True iff child grants no more than parent (for delegation links)."""
+    """True iff child grants no more than parent (for delegation links).
+
+    Limits are monotonic over *missing* keys too (H-2): a child that still
+    allows an action must carry every limit key the parent carries for it,
+    with value <= the parent's. Dropping a key (e.g. a spending cap) while
+    keeping the action allowed is a widening, not a narrowing — enforcement
+    must never read an absent key as "unlimited".
+    """
     c, p = _norm_scope(child), _norm_scope(parent)
     if any(pat not in p["allow"] for pat in c["allow"]):
         return False, "allow list wider than delegator's"
     if any(pat not in c["deny"] for pat in p["deny"]):
         return False, "cannot drop a delegator's deny"
-    for action, lim in c["limits"].items():
-        plim = p["limits"].get(action, {})
-        for k, v in lim.items():
-            pv = plim.get(k)
-            if pv is not None and v > pv:
-                return False, f"limit {action}.{k} looser than delegator's"
+    for action, plim in p["limits"].items():
+        if _looks_like_pattern(action):
+            # Not a valid limit key shape; issuance and verification reject
+            # pattern limit keys elsewhere — narrowing must not hinge on
+            # them.
+            continue
+        if not scope_allows(c, action):
+            continue  # child dropped the action: no limit to carry
+        clim = c["limits"].get(action, {})
+        for k, pv in plim.items():
+            cv = clim.get(k)
+            if cv is None:
+                return False, (
+                    f"limit {action}.{k} missing: delegator caps it at "
+                    f"{pv} and the child still allows '{action}'")
+            if cv > pv:
+                return False, (
+                    f"limit {action}.{k} looser than delegator's "
+                    f"({cv} > {pv})")
+    return True, ""
+
+
+def chain_required_limits(cred):
+    """Limit keys the delegation chain requires, per action.
+
+    Returns {action: {key: min_value}} — the union of limit keys across
+    every delegation link's scope (the credential's own scope excluded:
+    this is what the chain *requires*, used to fail closed when the
+    credential omits a key). The minimum value across links is reported;
+    under sound narrowing the credential's own value is the minimum.
+    Pattern-looking action keys are skipped (invalid; rejected elsewhere).
+    Never raises on malformed input.
+    """
+    required = {}
+    try:
+        links = cred.get("delegations") if isinstance(cred, dict) else None
+    except Exception:
+        return required
+    for link in links or []:
+        if not isinstance(link, dict):
+            continue
+        try:
+            limits = _norm_scope(link.get("scope"))["limits"]
+        except Exception:
+            continue
+        for action, lim in limits.items():
+            if _looks_like_pattern(action) or not isinstance(lim, dict):
+                continue
+            slot = required.setdefault(action, {})
+            for k, v in lim.items():
+                if isinstance(v, bool) or not isinstance(v, int):
+                    continue
+                slot[k] = v if k not in slot else min(slot[k], v)
+    return required
+
+
+def check_chain_limits_present(cred, atype):
+    """Enforcement-time fail-closed check (H-2).
+
+    If the delegation chain implies a limit key for `atype` (some ancestor
+    link caps it) but the credential's own scope omits that key, the
+    credential is malformed relative to the chain: deny. An absent key is
+    never "unlimited". Returns (ok, reasons). Defense in depth — the chain
+    check already enforces this for well-formed chains; this guards the
+    enforcement points themselves.
+    """
+    scope = cred.get("scope") if isinstance(cred, dict) else None
+    normed = _norm_scope(scope)
+    if not scope_allows(normed, atype):
+        return True, []  # scope denial happens at the scope check
+    have = normed["limits"].get(atype, {})
+    missing = sorted(k for k in chain_required_limits(cred).get(atype, {})
+                     if k not in have)
+    if missing:
+        return False, [
+            f"limit key(s) {', '.join(missing)} for '{atype}' required by "
+            f"the delegation chain but missing from the credential; "
+            f"failing closed"]
     return True, ""
 
 
@@ -189,6 +268,20 @@ def issue_credential(*, principal_id, principal_priv_hex, principal_pub_hex,
     scope = _norm_scope(scope)
     links = list(delegations)
     if links:
+        # Issuance-time chain soundness (H-2): every link must narrow its
+        # parent, and the credential must narrow the last link. A
+        # compromised intermediate cannot mint a widening link into a
+        # principal-signed credential — issuance fails loudly instead.
+        prev_scope = None
+        for i, link in enumerate(links):
+            if not isinstance(link, dict):
+                raise ValueError(f"delegation link {i} is not an object")
+            if i > 0:
+                ok, why = scope_narrows(link.get("scope"), prev_scope)
+                if not ok:
+                    raise ValueError(
+                        f"delegation link {i} invalid: {why}")
+            prev_scope = link.get("scope")
         ok, why = scope_narrows(scope, links[-1]["scope"])
         if not ok:
             raise ValueError(f"credential scope invalid: {why}")
@@ -365,6 +458,12 @@ def verify_action_request(req, trusted_issuers, now=None,
     atype = action.get("type", "")
     _check(scope_allows(cred["scope"], atype), reasons,
            f"action '{atype}' outside authorized scope")
+    # H-2 enforcement-time fail-closed: a limit key the delegation chain
+    # requires must not vanish at the credential — absent is never
+    # "unlimited".
+    ok_cl, why_cl = check_chain_limits_present(cred, atype)
+    if not ok_cl:
+        return False, reasons + why_cl
     if usage is not None:
         normed = _norm_scope(cred["scope"])
         if any(_looks_like_pattern(k) for k in normed["limits"]):
@@ -603,6 +702,13 @@ def verify_action_request_v2(req, *, manifest, operator_pubkeys,
         # outright instead of verifying with no limits.
         return False, ["credential 'limits' keys must be literal action "
                        "types, not patterns; failing closed"], {}
+    # H-2 enforcement-time fail-closed: the delegation chain may require
+    # limit keys the credential omits. Absent is never "unlimited".
+    # (Defense in depth — step 4's chain check already enforces this for
+    # well-formed chains.)
+    ok_cl, why_cl = check_chain_limits_present(cred, atype)
+    if not ok_cl:
+        return False, why_cl, {}
     lim = normed["limits"].get(atype, {})
     day = time.strftime("%Y-%m-%d", time.gmtime(now))
     if usage is not None:
