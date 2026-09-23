@@ -37,29 +37,17 @@ jobs:
       - name: Deploy on the box via SSM
         id: deploy
         run: |
-          cat > /tmp/deploy.sh <<'SCRIPT'
-          set -e
-          echo "=== pre-deploy ==="
-          cd /opt/vouch
-          echo "before: $(git rev-parse HEAD)"
-          git fetch origin main
-          git checkout -q main
-          git pull --ff-only origin main
-          echo "after:  $(git rev-parse HEAD)"
-          echo "=== deploy ==="
-          bash /opt/vouch/deploy.sh
-          echo "=== containers ==="
-          (docker compose ps 2>/dev/null || docker ps) | head -20
-          echo "=== port check ==="
-          (ss -tlnp 2>/dev/null | grep -E ':(9005|9011) ' || echo "ports 9005/9011 free")
-          echo "=== demo endpoint ==="
-          curl -sk -o /dev/null -w "GET /demo -> %{http_code}\n" https://localhost/demo
-          SCRIPT
-          CMD_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name AWS-RunShellScript \
-            --parameters "commands=$(cat /tmp/deploy.sh | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().splitlines()))')" \
-            --timeout-seconds 1200 \
+          python3 -c "
+          import json
+          cmds = open('scripts/ssm-deploy.sh').read().splitlines()
+          open('/tmp/ssm_input.json', 'w').write(json.dumps({
+              'InstanceIds': ['i-0044239302886d81f'],
+              'DocumentName': 'AWS-RunShellScript',
+              'Parameters': {'commands': cmds},
+              'TimeoutSeconds': 1200,
+          }))
+          "
+          CMD_ID=$(aws ssm send-command --cli-input-json file:///tmp/ssm_input.json \
             --query 'Command.CommandId' --output text)
           echo "command_id=$CMD_ID"
           echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
