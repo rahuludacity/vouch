@@ -56,6 +56,7 @@ from gatekeeper.ingest import ReceiptEmitter  # noqa: E402
 from gatekeeper.receipts import ReceiptLog  # noqa: E402
 from gatekeeper.tenants import TenantRegistry  # noqa: E402
 from services.verifier import credentials  # noqa: E402
+from services.verifier import rfc9421  # noqa: E402
 
 BIND = os.environ.get("VOUCH_BIND", "127.0.0.1")
 PORT = int(os.environ.get("VERIFIER_PORT", "9005"))
@@ -181,9 +182,12 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, code, obj):
-        body = json.dumps(obj).encode("utf-8")
+        self._send_bytes(code, json.dumps(obj).encode("utf-8"),
+                         "application/json")
+
+    def _send_bytes(self, code, body, content_type):
         self.send_response(code)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -193,8 +197,32 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "service": "verifier",
                              "trusted_issuers": len(TRUSTED_ISSUERS),
                              "principal_daily_limit": PRINCIPAL_DAILY_LIMIT})
+        elif self.path.split("?", 1)[0] == "/.well-known/vouch-keys":
+            self._serve_key_directory()
         else:
             self._send(404, {"error": "not_found"})
+
+    def _serve_key_directory(self):
+        """GET /.well-known/vouch-keys — RFC 9421 key directory (JWKS).
+
+        The manifest JSON path comes from $VOUCH_MANIFEST_PATH (read per
+        request so the directory tracks manifest rebuilds). Unset or
+        unreadable -> 404 {"error":"no_manifest"}.
+        """
+        try:
+            manifest_path = os.environ.get("VOUCH_MANIFEST_PATH", "")
+            if not manifest_path:
+                raise ValueError("VOUCH_MANIFEST_PATH unset")
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+            directory = rfc9421.build_key_directory(manifest)
+        except Exception:
+            # Fail closed: no directory without a readable manifest.
+            # (No manifest details leak into the response.)
+            self._send(404, {"error": "no_manifest"})
+            return
+        self._send_bytes(200, json.dumps(directory).encode("utf-8"),
+                         "application/http-message-signatures-directory+json")
 
     def do_POST(self):
         if self.path != "/v1/verify":
