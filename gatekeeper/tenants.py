@@ -15,6 +15,12 @@ CLI:
     python3 -m gatekeeper.tenants create <tenant-id>
     python3 -m gatekeeper.tenants rotate <tenant-id>
     python3 -m gatekeeper.tenants list
+
+Key hygiene (H-5): key material is NEVER printed to stdout — only the
+key id (kid). On create/rotate the fresh key is written once to a
+0600 file for operator capture and the CLI prints that path instead.
+The registry file itself is 0600 as well: it holds every tenant's
+signing keys.
 """
 import json
 import os
@@ -47,6 +53,9 @@ class TenantRegistry:
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"tenants": self._tenants}, f, indent=2)
+        # H-5: the registry holds every tenant's signing-key material —
+        # 0600, never group/world-readable, even on a shared box.
+        os.chmod(tmp, 0o600)
         os.replace(tmp, self.path)
 
     def _require(self, tenant_id):
@@ -109,6 +118,25 @@ class TenantRegistry:
                 for tid, t in self._tenants.items()
             }
 
+    def write_key_capture(self, tenant_id, kid):
+        """Write the kid's key material to a 0600 file for one-time capture.
+
+        Returns the file path. Key material is NEVER printed: CLI callers
+        print only this path (H-5). The operator reads the file once and
+        is responsible for deleting it afterwards.
+        """
+        with self._lock:
+            t = self._require(tenant_id)
+            key_hex = t["keys"][kid]
+        path = os.path.join(os.path.dirname(self.path),
+                            f"{tenant_id}.{kid}.key")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(key_hex + "\n")
+        # ...in case the file already existed with wider permissions.
+        os.chmod(path, 0o600)
+        return path
+
     # ---------- key resolution (ReceiptLog interface) ----------
     def signing_key(self, tenant_id):
         """(kid, key_bytes) to sign new receipts for tenant_id."""
@@ -132,12 +160,14 @@ def main(argv):
     cmd, rest = argv[1], argv[2:]
     if cmd == "create" and len(rest) == 1:
         kid, key = reg.create(rest[0])
+        key_path = reg.write_key_capture(rest[0], kid)
         print(f"tenant '{rest[0]}' created (kid={kid}). Key stored in {reg.path}; keep it secret.")
-        print(f"key_hex={key}")
+        print(f"signing key written to {key_path} (mode 0600) for one-time operator capture; it is never printed.")
     elif cmd == "rotate" and len(rest) == 1:
         kid, key = reg.rotate(rest[0])
+        key_path = reg.write_key_capture(rest[0], kid)
         print(f"tenant '{rest[0]}' rotated to {kid}. Old receipts still verify.")
-        print(f"new_key_hex={key}")
+        print(f"signing key written to {key_path} (mode 0600) for one-time operator capture; it is never printed.")
     elif cmd == "list" and not rest:
         for tid, info in reg.list_tenants().items():
             print(f"{tid}: current={info['current_kid']} keys={info['kids']}")

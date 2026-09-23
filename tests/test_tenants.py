@@ -1,10 +1,14 @@
 """Tests for per-tenant signing keys: registry, rotation, and
 tenant-scoped receipt signing/verification (incl. cross-tenant forgery)."""
 import json
+import contextlib
+import io
 import os
+import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -194,6 +198,80 @@ class TenantReceiptsTest(unittest.TestCase):
                    args={}, decision="allow")
         ok, failures = ReceiptLog(path, "dev-only-change-me").verify()
         self.assertTrue(ok, failures)
+
+
+class TenantCliKeyHygieneTest(unittest.TestCase):
+    """H-5: tenant create/rotate must never print key material.
+
+    Captures the CLI's stdout and asserts the actual hex key is absent;
+    the fresh key goes to a 0600 capture file whose path (not the key)
+    is what gets printed.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vouch-tenants-cli-")
+        self.reg_path = os.path.join(self.tmp, "tenants.json")
+        self._env = mock.patch.dict(
+            os.environ, {"GATEKEEPER_TENANTS_PATH": self.reg_path})
+        self._env.start()
+        from gatekeeper import tenants as tenants_mod  # noqa: E402
+        self.tenants_mod = tenants_mod
+
+    def tearDown(self):
+        self._env.stop()
+
+    def _run(self, *argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = self.tenants_mod.main(["tenants", *argv])
+        return rc, buf.getvalue()
+
+    def _key_hex(self, tenant):
+        reg = TenantRegistry(self.reg_path)
+        kid, key = reg.signing_key(tenant)
+        return kid, key.hex()
+
+    def _assert_capture_file(self, tenant, kid, key_hex):
+        path = os.path.join(self.tmp, f"{tenant}.{kid}.key")
+        self.assertTrue(os.path.isfile(path),
+                        f"key capture file missing: {path}")
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600,
+                         "capture file must be owner-only")
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), key_hex)
+        return path
+
+    def test_create_prints_kid_not_key(self):
+        rc, out = self._run("create", "acme")
+        self.assertEqual(rc, 0)
+        kid, key_hex = self._key_hex("acme")
+        self.assertIn(kid, out)  # the key id is fine to print
+        self.assertNotIn(key_hex, out)  # the key material is not
+        path = self._assert_capture_file("acme", kid, key_hex)
+        self.assertIn(path, out)  # only the path is printed
+
+    def test_rotate_prints_kid_not_key(self):
+        self._run("create", "acme")
+        rc, out = self._run("rotate", "acme")
+        self.assertEqual(rc, 0)
+        kid, key_hex = self._key_hex("acme")
+        self.assertIn(kid, out)
+        self.assertNotIn(key_hex, out)
+        path = self._assert_capture_file("acme", kid, key_hex)
+        self.assertIn(path, out)
+
+    def test_list_prints_no_key_material(self):
+        self._run("create", "acme")
+        self._run("rotate", "acme")
+        rc, out = self._run("list")
+        self.assertEqual(rc, 0)
+        reg = TenantRegistry(self.reg_path)
+        for kid, key in reg.verification_keys("acme").items():
+            self.assertNotIn(key.hex(), out)
+
+    def test_registry_file_is_0600(self):
+        self._run("create", "acme")
+        self.assertEqual(stat.S_IMODE(os.stat(self.reg_path).st_mode), 0o600)
 
 
 if __name__ == "__main__":
