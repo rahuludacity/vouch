@@ -16,11 +16,11 @@ CLI:
     python3 -m gatekeeper.tenants rotate <tenant-id>
     python3 -m gatekeeper.tenants list
 
-Key hygiene (H-5): key material is NEVER printed to stdout — only the
-key id (kid). On create/rotate the fresh key is written once to a
-0600 file for operator capture and the CLI prints that path instead.
-The registry file itself is 0600 as well: it holds every tenant's
-signing keys.
+Key hygiene (H-5): key material is NEVER printed to stdout and NEVER
+written anywhere except the 0600 registry file itself. The CLI prints
+only the tenant id and key id; the create()/rotate() return values are
+discarded at the CLI boundary. The registry file is 0600: it holds
+every tenant's signing keys.
 """
 import json
 import os
@@ -118,25 +118,6 @@ class TenantRegistry:
                 for tid, t in self._tenants.items()
             }
 
-    def write_key_capture(self, tenant_id, kid):
-        """Write the kid's key material to a 0600 file for one-time capture.
-
-        Returns the file path. Key material is NEVER printed: CLI callers
-        print only this path (H-5). The operator reads the file once and
-        is responsible for deleting it afterwards.
-        """
-        with self._lock:
-            t = self._require(tenant_id)
-            key_hex = t["keys"][kid]
-        path = os.path.join(os.path.dirname(self.path),
-                            f"{tenant_id}.{kid}.key")
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(key_hex + "\n")
-        # ...in case the file already existed with wider permissions.
-        os.chmod(path, 0o600)
-        return path
-
     # ---------- key resolution (ReceiptLog interface) ----------
     def signing_key(self, tenant_id):
         """(kid, key_bytes) to sign new receipts for tenant_id."""
@@ -159,15 +140,13 @@ def main(argv):
         return 2
     cmd, rest = argv[1], argv[2:]
     if cmd == "create" and len(rest) == 1:
-        kid, key = reg.create(rest[0])
-        key_path = reg.write_key_capture(rest[0], kid)
-        print(f"tenant '{rest[0]}' created (kid={kid}). Key stored in {reg.path}; keep it secret.")
-        print(f"signing key written to {key_path} (mode 0600) for one-time operator capture; it is never printed.")
+        # H-5: the returned key is discarded at the CLI boundary — it
+        # lives only in the 0600 registry file. Print tenant/kid only.
+        kid, _key = reg.create(rest[0])
+        print(f"tenant '{rest[0]}' created (kid={kid}). Key stored in {reg.path} (mode 0600); keep it secret.")
     elif cmd == "rotate" and len(rest) == 1:
-        kid, key = reg.rotate(rest[0])
-        key_path = reg.write_key_capture(rest[0], kid)
+        kid, _key = reg.rotate(rest[0])
         print(f"tenant '{rest[0]}' rotated to {kid}. Old receipts still verify.")
-        print(f"signing key written to {key_path} (mode 0600) for one-time operator capture; it is never printed.")
     elif cmd == "list" and not rest:
         for tid, info in reg.list_tenants().items():
             print(f"{tid}: current={info['current_kid']} keys={info['kids']}")
