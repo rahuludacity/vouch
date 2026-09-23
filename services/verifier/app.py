@@ -106,6 +106,10 @@ class VerifierState:
         # Phase 11: spending ceilings, keyed (credential_id, action_type,
         # day) -> cents used. Only actions with amount_cents add to it.
         self._spending = {}
+        # Principal-approval nonces (prepare mode), keyed nonce -> expiry.
+        # Separate namespace from request nonces; a consumed approval
+        # cannot authorize a second action.
+        self._approval_nonces = {}
 
     def _prune(self, now):
         for n, exp in list(self._nonces.items()):
@@ -128,6 +132,29 @@ class VerifierState:
                 # a monotonic expiry, so the front of the dict is the oldest.
                 self._nonces.pop(next(iter(self._nonces)))
             self._nonces[nonce] = now + 2 * credentials.CLOCK_SKEW
+            return True
+
+    def approval_nonce_seen(self, nonce):
+        """Membership test for consumed approval nonces (read-only)."""
+        with self._lock:
+            return nonce in self._approval_nonces
+
+    def check_and_reserve_approval(self, nonce, expires_at, now):
+        """Reserve an approval nonce. False = already consumed (replay).
+
+        The reservation lasts until the approval's own expiry, so a used
+        approval cannot be replayed at any point while it is still valid.
+        """
+        with self._lock:
+            for n, exp in list(self._approval_nonces.items()):
+                if exp <= now:
+                    del self._approval_nonces[n]
+            if nonce in self._approval_nonces:
+                return False
+            while len(self._approval_nonces) >= self.MAX_NONCES:
+                self._approval_nonces.pop(
+                    next(iter(self._approval_nonces)))
+            self._approval_nonces[nonce] = expires_at
             return True
 
     def agent_used(self, agent_pubkey, action_type, day):
@@ -199,7 +226,8 @@ def decide(req):
                 cred if isinstance(cred, dict) else None, None)
 
     ok, reasons = credentials.verify_action_request(
-        req, TRUSTED_ISSUERS, now=now, usage=_UsageView(STATE))
+        req, TRUSTED_ISSUERS, now=now, usage=_UsageView(STATE),
+        approval_nonces=_ApprovalNoncesView(STATE))
     if not ok:
         return ("deny", "; ".join(reasons), "unverified",
                 cred if isinstance(cred, dict) else None, None)
@@ -212,6 +240,12 @@ def decide(req):
         return ("deny",
                 f"principal rate limit exceeded: {used}/{PRINCIPAL_DAILY_LIMIT}/day",
                 "unverified", cred, None)
+
+    # Single-use principal approvals (prepare mode): reserve the nonce now
+    # that the request is allowed. A racing duplicate is denied here.
+    if not _reserve_approval_nonce(req, cred, now):
+        return ("deny", "approval replay: nonce already used", "unverified",
+                cred, None)
 
     STATE.record_allow(cred["agent_pubkey"], principal_pubkey, atype, day)
     return ("allow", "credential valid; action within scope",
@@ -239,7 +273,8 @@ def _decide_v2(req, now, tenant_id, cred, action, atype):
     ok, reasons, evidence = credentials.verify_action_request_v2(
         req, manifest=manifest, operator_pubkeys=OPERATOR_PUBKEYS,
         policy_hook=hook, now=now, nonces=_NoncesView(STATE),
-        usage=_UsageView(STATE), spending=_SpendingView(STATE))
+        usage=_UsageView(STATE), spending=_SpendingView(STATE),
+        approval_nonces=_ApprovalNoncesView(STATE))
     if not ok:
         return ("deny", "; ".join(reasons), "unverified",
                 cred if isinstance(cred, dict) else None, None)
@@ -281,9 +316,34 @@ def _decide_v2(req, now, tenant_id, cred, action, atype):
                     f"{used_cents + amount}/{ceiling} {atype}/day (cents)",
                     "unverified", cred, None)
 
+    # Single-use principal approvals (prepare mode): reserve the nonce now
+    # that the request is allowed. A racing duplicate is denied here.
+    if not _reserve_approval_nonce(req, cred, now):
+        return ("deny", "approval replay: nonce already used",
+                "unverified", cred if isinstance(cred, dict) else None,
+                None)
+
     STATE.record_allow(cred["agent_pubkey"], principal_pubkey, atype, day)
     return ("allow", "credential valid; action within scope",
             "verified-agent", cred, evidence)
+
+
+def _reserve_approval_nonce(req, cred, now):
+    """Reserve a request's principal-approval nonce on allow.
+
+    Returns True when there is no approval to reserve or the reservation
+    succeeded; False when the approval was already consumed (replay).
+    """
+    approval = req.get("principal_approval") if isinstance(req, dict) \
+        else None
+    if not isinstance(approval, dict) or not approval.get("nonce"):
+        return True
+    expires_at = approval.get("expires_at")
+    if (isinstance(expires_at, bool)
+            or not isinstance(expires_at, (int, float))):
+        expires_at = now
+    return STATE.check_and_reserve_approval(
+        approval["nonce"], expires_at, now)
 
 
 class _UsageView:
@@ -305,6 +365,16 @@ class _NoncesView:
 
     def __contains__(self, nonce):
         return self._state.nonce_seen(nonce)
+
+
+class _ApprovalNoncesView:
+    """Read-only membership view of STATE's consumed approval nonces."""
+
+    def __init__(self, state):
+        self._state = state
+
+    def __contains__(self, nonce):
+        return self._state.approval_nonce_seen(nonce)
 
 
 class _SpendingView:

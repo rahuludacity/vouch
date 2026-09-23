@@ -26,6 +26,7 @@ A child scope narrows a parent scope: every allow pattern must appear
 verbatim in the parent's allow list, denies can only be added, and numeric
 limits can only tighten. Simple, sound, and auditable.
 """
+import copy
 import fnmatch
 import json
 import secrets
@@ -215,24 +216,223 @@ def check_chain_limits_present(cred, atype):
     return True, ""
 
 
+# ---------------------------------------------------------------- modes
+# PRD §3: delegation modes read < prepare < execute, the demand-driven
+# scope catalog, and signed principal approval for prepare-mode effect
+# actions. Design: docs/modes-design.md. A credential/link without a mode
+# (mode=None) is the legacy pre-mode path: no mode or catalog checks.
+
+_MODES = ("read", "prepare", "execute")
+_MODE_RANK = {"read": 0, "prepare": 1, "execute": 2}
+
+# Canonical scope vocabulary (PRD "Delegation scope catalog"). The effect
+# class drives the mode check: read = observable only; draft = buildable
+# with no external effect; effect = external effect (principal approval
+# required in prepare mode, allowed outright in execute, denied in read).
+SCOPE_CATALOG = {
+    "inbox.read":        ("read",   "Read inbox messages."),
+    "calendar.read":     ("read",   "Read calendar events."),
+    "payments.read":     ("read",   "Read balances/transactions (forecasts, audits)."),
+    "research.web":      ("read",   "Web research; no external mutation."),
+    "crm.read":          ("read",   "Read CRM records."),
+    "travel.recommend":  ("read",   "Recommend travel options; no booking."),
+    "messaging.draft":   ("draft",  "Compose a message; no send."),
+    "publish.draft":     ("draft",  "Assemble a publish payload; no publish."),
+    "payments.initiate": ("draft",  "Construct a payment instruction; no movement."),
+    "messaging.send":    ("effect", "Send a message."),
+    "calendar.write":    ("effect", "Create/modify events (sends invites)."),
+    "crm.write":         ("effect", "Create/modify CRM records."),
+    "payments.execute":  ("effect", "Execute a payment / move money."),
+}
+
+# Default principal-approval lifetime: 15 minutes (design judgment call).
+APPROVAL_TTL_S = 900
+
+
+def _validate_mode(mode, *, where):
+    if mode is not None and mode not in _MODES:
+        raise ValueError(
+            f"{where}: unknown delegation mode {mode!r}; must be one of "
+            f"{list(_MODES)}")
+
+
+def validate_catalog_scope(scope):
+    """Issuance-time: a mode-carrying grant must speak the catalog.
+
+    Every allow/deny entry must be a catalog scope or a pattern matching
+    at least one catalog scope (e.g. "payments.*" is fine; "pay.*" is
+    rejected as unknown). Raises ValueError otherwise — fail fast on
+    typos instead of minting a grant that can never verify.
+    """
+    problems = []
+    normed = _norm_scope(scope)
+    for pat in normed["allow"] + normed["deny"]:
+        if pat in SCOPE_CATALOG:
+            continue
+        if (_looks_like_pattern(pat)
+                and any(fnmatch.fnmatchcase(c, pat)
+                        for c in SCOPE_CATALOG)):
+            continue
+        problems.append(pat)
+    if problems:
+        raise ValueError(
+            f"unknown scope(s) {problems}; mode-carrying grants must use "
+            f"the Vouch scope catalog "
+            f"({', '.join(sorted(SCOPE_CATALOG))})")
+
+
+def issue_principal_approval(*, principal_priv_hex, credential_id, action,
+                             ttl_s=APPROVAL_TTL_S, issued_at=None,
+                             nonce=None):
+    """Mint a signed principal approval for one exact action.
+
+    The principal (holder of the credential's issuer key) authorizes the
+    agent to execute *this* action under a prepare-mode credential. The
+    signature binds the exact action payload, the credential_id, a
+    single-use nonce, and the expiry: replaying it for another action,
+    another credential, or a second time does not verify.
+    """
+    now = _ts(issued_at)
+    approval = {
+        "credential_id": credential_id,
+        "action": copy.deepcopy(action),
+        "nonce": nonce or uuid.uuid4().hex,
+        "issued_at": now,
+        "expires_at": round(now + ttl_s, 3),
+    }
+    approval["signature"] = ed25519.sign_hex(
+        principal_priv_hex, canonical(_unsigned(approval)))
+    return approval
+
+
+def verify_principal_approval(approval, *, principal_pubkey, action,
+                              credential_id, now=None, seen_nonces=None):
+    """Verify a principal approval. Returns (ok, reasons). Never raises.
+
+    Checks: shape, credential binding, exact-action binding (canonical
+    bytes), validity window, principal signature, and single-use nonce.
+    seen_nonces is membership-read only; the caller reserves on allow.
+    """
+    now = _ts(now)
+    reasons = []
+    if not isinstance(approval, dict):
+        return False, ["principal approval is not an object"]
+    for f in ("credential_id", "action", "nonce", "issued_at",
+              "expires_at", "signature"):
+        _check(f in approval, reasons, f"approval missing field '{f}'")
+    if reasons:
+        return False, reasons
+    _check(approval["credential_id"] == credential_id, reasons,
+           "approval is for a different credential")
+    try:
+        action_match = (canonical(approval["action"]) == canonical(action))
+    except Exception:
+        action_match = False
+    _check(action_match, reasons,
+           "approval does not authorize this exact action")
+    _check(approval["issued_at"] <= now + CLOCK_SKEW, reasons,
+           "approval not yet valid")
+    # Expiry is strict: no clock-skew grace extends an approval.
+    _check(isinstance(approval["expires_at"], (int, float))
+           and not isinstance(approval["expires_at"], bool)
+           and now < approval["expires_at"], reasons, "approval expired")
+    try:
+        sig_ok = bool(ed25519.verify_hex(principal_pubkey,
+                                         canonical(_unsigned(approval)),
+                                         approval["signature"]))
+    except Exception:
+        sig_ok = False
+    _check(sig_ok, reasons,
+           "approval signature invalid (not signed by the principal?)")
+    if seen_nonces is not None:
+        try:
+            seen = approval["nonce"] in seen_nonces
+        except Exception:
+            seen = True  # unusable nonce store: fail closed
+        _check(not seen, reasons, "approval replay: nonce already used")
+    return not reasons, reasons
+
+
+def _check_mode(cred, action, principal_approval, now, approval_nonces):
+    """PRD mode enforcement for one action request. Returns (ok, reasons).
+
+    mode None (legacy pre-mode credential): no mode checks at all.
+    Unknown mode: deny (fail closed). For mode-carrying credentials the
+    action type must be a catalog scope, and prepare + effect-class
+    action requires a valid signed principal approval.
+    """
+    mode = cred.get("mode") if isinstance(cred, dict) else None
+    if mode is None:
+        return True, []
+    if mode not in _MODES:
+        return False, [f"unknown delegation mode {mode!r}; failing closed"]
+    atype = action.get("type", "") if isinstance(action, dict) else ""
+    entry = SCOPE_CATALOG.get(atype)
+    if entry is None:
+        return False, [f"unknown scope '{atype}': not in the Vouch scope "
+                        f"catalog; failing closed"]
+    effect = entry[0]
+    if effect == "read":
+        return True, []
+    if mode == "read":
+        return False, [f"delegation mode 'read' does not authorize "
+                        f"'{atype}'"]
+    if effect == "draft":
+        # Building the draft IS the prepare-mode job: no approval needed.
+        return True, []
+    if mode == "execute":
+        return True, []
+    # mode == "prepare", effect-class action: principal approval required.
+    if not isinstance(principal_approval, dict):
+        return False, [f"delegation mode 'prepare' requires a signed "
+                        f"principal approval for '{atype}'"]
+    ok_a, why_a = verify_principal_approval(
+        principal_approval,
+        principal_pubkey=cred.get("issuer_pubkey"),
+        action=action, credential_id=cred.get("credential_id"),
+        now=now, seen_nonces=approval_nonces)
+    if not ok_a:
+        return False, [f"principal approval rejected for '{atype}': {w}"
+                       for w in why_a]
+    return True, ""
+
+
 # ---------------------------------------------------------------- issuance
 def issue_delegation(*, delegator_priv_hex, delegator_pub_hex,
                      delegatee_pub_hex, scope, revocation_handle=None,
-                     ttl_s=3600, issued_at=None):
+                     ttl_s=3600, issued_at=None, mode=None,
+                     parent_mode=None):
     """One signed delegation link. Returns the link dict (with signature).
 
     revocation_handle: "rh-"+12 hex from secrets when not supplied; it is
     part of the signed link so the operator can revoke this grant via the
     manifest's revoked_credentials list. Default ttl is 1h (short-lived
     delegation grants).
+
+    mode: PRD delegation mode for this grant (None = legacy pre-mode).
+    A mode-carrying link's scope must speak the scope catalog, and the mode
+    must not exceed parent_mode. parent_mode is advisory (caller-supplied):
+    the authoritative escalation check happens at verification over the
+    signed chain.
     """
     _reject_pattern_limit_keys(scope)
     _validate_limit_values(scope)
+    _validate_mode(mode, where="delegation")
+    _validate_mode(parent_mode, where="parent delegation")
+    if mode is not None:
+        validate_catalog_scope(scope)
+        if (parent_mode is not None
+                and _MODE_RANK[mode] > _MODE_RANK[parent_mode]):
+            raise ValueError(
+                f"delegation mode escalation: {parent_mode!r} -> "
+                f"{mode!r}; a delegator cannot grant more mode than it "
+                f"holds")
     now = _ts(issued_at)
     link = {
         "delegator_pubkey": delegator_pub_hex,
         "delegatee_pubkey": delegatee_pub_hex,
         "scope": _norm_scope(scope),
+        "mode": mode,
         "issued_at": now,
         "expires_at": round(now + ttl_s, 3),
         "revocation_handle": revocation_handle or _new_revocation_handle(),
@@ -249,7 +449,7 @@ def _unsigned(d):
 def issue_credential(*, principal_id, principal_priv_hex, principal_pub_hex,
                      agent_id, agent_pub_hex, scope,
                      delegations=(), revocation_handle=None, ttl_s=86400,
-                     issued_at=None, credential_id=None):
+                     issued_at=None, credential_id=None, mode=None):
     """Mint an agent credential, signed by the principal (the issuer).
 
     delegations: extra links appended after the implicit principal->agent
@@ -261,10 +461,19 @@ def issue_credential(*, principal_id, principal_priv_hex, principal_pub_hex,
     of the signed credential so the operator can revoke it via the
     manifest's revoked_credentials list. Default ttl stays 24h (existing
     flows/demos depend on it); delegations default to 1h.
+
+    mode: PRD delegation mode for this credential (None = legacy pre-mode).
+    A mode-carrying credential's scope must speak the scope catalog, and
+    the whole chain must be mode-carrying with non-increasing modes — a
+    mode upgrade needs a fresh principal-signed root grant (the
+    principal's re-approval), never an intermediate's say-so.
     """
     now = _ts(issued_at)
     _reject_pattern_limit_keys(scope)
     _validate_limit_values(scope)
+    _validate_mode(mode, where="credential")
+    if mode is not None:
+        validate_catalog_scope(scope)
     scope = _norm_scope(scope)
     links = list(delegations)
     if links:
@@ -285,12 +494,38 @@ def issue_credential(*, principal_id, principal_priv_hex, principal_pub_hex,
         ok, why = scope_narrows(scope, links[-1]["scope"])
         if not ok:
             raise ValueError(f"credential scope invalid: {why}")
+        if mode is not None:
+            # Mode-carrying credential: the chain must be mode-carrying
+            # end to end, with known, non-increasing modes.
+            for i, link in enumerate(links):
+                lm = link.get("mode")
+                if lm is None:
+                    raise ValueError(
+                        f"credential mode {mode!r} requires every "
+                        f"delegation link to carry a mode (link {i} has "
+                        f"none); re-issue the chain with modes")
+                if lm not in _MODES:
+                    raise ValueError(
+                        f"delegation link {i} has unknown mode {lm!r}")
+            for i in range(1, len(links)):
+                if (_MODE_RANK[links[i]["mode"]]
+                        > _MODE_RANK[links[i - 1]["mode"]]):
+                    raise ValueError(
+                        f"delegation mode escalation at link {i}: "
+                        f"{links[i - 1]['mode']!r} -> "
+                        f"{links[i]['mode']!r}")
+            if _MODE_RANK[mode] > _MODE_RANK[links[-1]["mode"]]:
+                raise ValueError(
+                    f"credential mode {mode!r} exceeds the last delegation "
+                    f"link's mode {links[-1]['mode']!r}; a higher mode "
+                    f"needs a fresh principal-signed grant")
     cred = {
         "credential_id": credential_id or f"cred-{uuid.uuid4().hex[:12]}",
         "principal": {"id": principal_id, "pubkey": principal_pub_hex},
         "agent_id": agent_id,
         "agent_pubkey": agent_pub_hex,
         "scope": scope,
+        "mode": mode,
         "issued_at": now,
         "expires_at": round(now + ttl_s, 3),
         "delegations": links,
@@ -378,6 +613,35 @@ def _verify_chain(cred, now):
             ok_n, why_n = scope_narrows(link.get("scope"), prev_scope)
             _check(ok_n, reasons, f"link {i}: scope widens ({why_n})")
         prev_scope = link.get("scope")
+    # PRD modes (H-3): a mode-carrying chain — any link or the credential
+    # carries a mode — must carry a *known* mode on every link and the
+    # credential, non-increasing along the chain. Mixed chains, unknown
+    # modes, and escalations deny (fail closed). A fully modeless chain is
+    # the legacy pre-mode path and skips this.
+    modes = ([l.get("mode") if isinstance(l, dict) else None
+              for l in links]
+             + [cred.get("mode")])
+    if any(m is not None for m in modes):
+        mode_bad = False
+        for i, m in enumerate(modes):
+            who = f"link {i}" if i < len(links) else "credential"
+            if m is None:
+                reasons.append(f"{who}: mode-carrying chain with a "
+                               f"modeless grant; failing closed")
+                mode_bad = True
+            elif m not in _MODES:
+                reasons.append(f"{who}: unknown delegation mode {m!r}; "
+                               f"failing closed")
+                mode_bad = True
+        if not mode_bad:
+            for i in range(1, len(modes)):
+                if _MODE_RANK[modes[i]] > _MODE_RANK[modes[i - 1]]:
+                    who = (f"link {i}" if i < len(links)
+                           else "credential")
+                    reasons.append(
+                        f"{who}: delegation mode escalation "
+                        f"({modes[i - 1]!r} -> {modes[i]!r}); a higher "
+                        f"mode needs a fresh principal-signed grant")
     _check(links[-1].get("delegatee_pubkey") == cred.get("agent_pubkey"),
            reasons, "chain does not terminate at the credential's agent")
     ok_n, why_n = scope_narrows(cred.get("scope"), prev_scope)
@@ -413,14 +677,17 @@ def verify_credential(cred, trusted_issuers, now=None):
 
 
 def verify_action_request(req, trusted_issuers, now=None,
-                         seen_nonces=None, usage=None):
+                         seen_nonces=None, usage=None, approval_nonces=None):
     """Verify a full action attempt. Returns (ok, reasons).
 
-    req: {"credential", "action", "nonce", "ts", "agent_signature"}
+    req: {"credential", "action", "nonce", "ts", "agent_signature",
+          "principal_approval" (optional, for prepare-mode effect actions)}
     seen_nonces: set-like of recently seen nonces (replay protection).
     usage: dict-like the caller maintains for rate limits, keyed
            (agent_pubkey, action_type, day) -> count. This function only
            *reads* it; the caller increments on allow.
+    approval_nonces: set-like of consumed principal-approval nonces
+           (membership read only; the caller reserves on allow).
     """
     now = _ts(now)
     reasons = []
@@ -464,6 +731,12 @@ def verify_action_request(req, trusted_issuers, now=None,
     ok_cl, why_cl = check_chain_limits_present(cred, atype)
     if not ok_cl:
         return False, reasons + why_cl
+    # PRD modes (H-3): read/prepare/execute enforcement; prepare-mode
+    # effect actions need a signed principal approval.
+    ok_m, why_m = _check_mode(cred, action, req.get("principal_approval"),
+                              now, approval_nonces)
+    if not ok_m:
+        return False, reasons + why_m
     if usage is not None:
         normed = _norm_scope(cred["scope"])
         if any(_looks_like_pattern(k) for k in normed["limits"]):
@@ -527,10 +800,11 @@ def _valid_ts(ts, now):
 
 def verify_action_request_v2(req, *, manifest, operator_pubkeys,
                              policy_hook=None, now=None, nonces=None,
-                             usage=None, spending=None):
+                             usage=None, spending=None, approval_nonces=None):
     """Verification v2: enrollment-anchored, PRD check order, fail-closed.
 
-    req: {"credential", "action", "nonce", "ts", "agent_signature"}.
+    req: {"credential", "action", "nonce", "ts", "agent_signature",
+          "principal_approval" (optional, for prepare-mode effect actions)}.
     manifest: the signed trust-root manifest dict (may be None -> deny).
     operator_pubkeys: trusted operator pubkey hex (str or list).
     policy_hook(tier, action_type) -> (ok, reason or None); a hook that
@@ -542,6 +816,8 @@ def verify_action_request_v2(req, *, manifest, operator_pubkeys,
     spending: dict-like for spending ceilings, keyed (credential_id,
         action_type, day) -> cents used (read only; the caller records on
         allow via an atomic check-and-add).
+    approval_nonces: set-like of consumed principal-approval nonces
+        (membership read only; the caller reserves on allow).
 
     Check order (first failure wins):
       1. manifest freshness        -> "trust root stale: ..." /
@@ -551,16 +827,25 @@ def verify_action_request_v2(req, *, manifest, operator_pubkeys,
                                         "key superseded", "enrollment
                                         expired", "credential revoked"
       3. credential signature       -> "credential signature invalid"
-      4. delegation chain           -> existing chain reasons
+      4. delegation chain           -> existing chain reasons (scope
+                                        narrowing + mode-chain rule)
       5. scope, then tier policy    -> "action '<t>' outside authorized
                                         scope", "action '<t>' requires
                                         <tier> enrollment"
-      6. timestamp skew, then replay -> "request timestamp outside
+      6. mode                       -> "unknown delegation mode ...",
+                                        "unknown scope ...",
+                                        "delegation mode 'read' does not
+                                        authorize ...",
+                                        "delegation mode 'prepare'
+                                        requires a signed principal
+                                        approval ..."
+      7. timestamp skew, then replay -> "request timestamp outside
                                         tolerance", "replayed request"
-      7. proof-of-possession        -> "agent signature invalid (not the
+      8. proof-of-possession        -> "agent signature invalid (not the
                                         credential holder?)"
-      8. limits                     -> "rate limit exceeded: ...",
-                                        "spending ceiling exceeded: ..."
+      9. limits                     -> "rate limit exceeded: ...",
+                                        "spending ceiling exceeded: ...",
+                                        chain-required limit keys missing
 
     Returns (ok, reasons, evidence). evidence holds the 7 frozen receipt
     fields on allow ({} on deny): principal_id, principal_tier, key_id,
@@ -664,7 +949,18 @@ def verify_action_request_v2(req, *, manifest, operator_pubkeys,
                            f"action '{atype}' requires higher-tier "
                            "enrollment"], {}
 
-    # -- 6. timestamp skew, then replay ---------------------------------
+    # -- 6. mode --------------------------------------------------------
+    # PRD: a prepare-mode action without a principal approval does not
+    # verify as authorized. Unknown modes deny (fail closed); legacy
+    # modeless credentials skip this step entirely.
+    ok_m, why_m = _check_mode(
+        cred, action,
+        req.get("principal_approval") if isinstance(req, dict) else None,
+        now, approval_nonces)
+    if not ok_m:
+        return False, why_m, {}
+
+    # -- 7. timestamp skew, then replay ---------------------------------
     if not _valid_ts(req.get("ts") if isinstance(req, dict) else None, now):
         return False, ["request timestamp outside tolerance"], {}
     if nonces is not None:
@@ -676,7 +972,7 @@ def verify_action_request_v2(req, *, manifest, operator_pubkeys,
         if seen:
             return False, ["replayed request"], {}
 
-    # -- 7. proof-of-possession -----------------------------------------
+    # -- 8. proof-of-possession -----------------------------------------
     pop_ok = False
     try:
         envelope = {
@@ -694,7 +990,7 @@ def verify_action_request_v2(req, *, manifest, operator_pubkeys,
         return False, ["agent signature invalid (not the credential "
                        "holder?)"], {}
 
-    # -- 8. limits: rate, then spending ----------------------------------
+    # -- 9. limits: rate, then spending ----------------------------------
     normed = _norm_scope(cred.get("scope"))
     if any(_looks_like_pattern(k) for k in normed["limits"]):
         # A credential minted outside issue_credential() with pattern limit
