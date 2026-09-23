@@ -14,5 +14,6 @@ echo "=== containers ==="
 (docker compose ps 2>/dev/null || docker ps) | head -20
 echo "=== port check ==="
 (ss -tlnp 2>/dev/null | grep -E ':(9005|9011) ' || echo "ports 9005/9011 free")
-echo "=== demo endpoint ==="
-curl -sk -o /dev/null -w "GET /demo -> %{http_code}\n" https://localhost/demo
+echo "=== demo endpoint (informational; public check runs in CI) ==="
+curl -sk -o /dev/null -w "GET /demo -> %{http_code}\n" https://localhost/demo || echo "local https check skipped (public verify runs in CI)"
+echo "=== done ==="
