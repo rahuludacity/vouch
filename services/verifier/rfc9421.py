@@ -24,6 +24,7 @@ import re
 import time
 
 from . import ed25519
+from .enrollment import jwk_thumbprint as _jwk_thumbprint
 
 # Cap on any single covered-component value (untrusted header input).
 _MAX_COMPONENT_LEN = 8192
@@ -43,19 +44,8 @@ _FIELD_RE = re.compile(r"^[a-z0-9][a-z0-9!#$%&'*+\-.^_`|~]*$")
 _SCHEME = "https"
 
 
-def _jwk_thumbprint(pubkey_hex):
-    # DEDUPE(phase9-merge): replace with from services.verifier.enrollment import jwk_thumbprint
-    """RFC 7638 JWK thumbprint of an Ed25519 pubkey (base64url, no pad)."""
-    try:
-        raw = bytes.fromhex(pubkey_hex)
-    except (ValueError, TypeError):
-        raise ValueError("pubkey must be hex")
-    if len(raw) != 32:
-        raise ValueError("pubkey must be 32 bytes")
-    x = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
-    jwk = '{"crv":"Ed25519","kty":"OKP","x":"' + x + '"}'
-    digest = hashlib.sha256(jwk.encode("ascii")).digest()
-    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+# jwk_thumbprint is canonical in enrollment.py — single implementation,
+# imported above. (The private duplicate was removed at the phase9+12 merge.)
 
 
 def _b64_nopad(raw: bytes) -> str:
