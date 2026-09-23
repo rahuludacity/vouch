@@ -71,6 +71,20 @@ TRUSTED_ISSUERS = [s.strip() for s in
                    if s.strip()]
 PRINCIPAL_DAILY_LIMIT = int(
     os.environ.get("VERIFIER_PRINCIPAL_DAILY_LIMIT", "1000"))
+# Phase 11: enrollment-anchored verification v2. When VOUCH_MANIFEST_PATH
+# is set, decide() verifies against the signed trust-root manifest (PRD
+# check order, tier policy hook) instead of the v1 trusted-issuers list.
+MANIFEST_PATH = os.environ.get("VOUCH_MANIFEST_PATH", "")
+OPERATOR_PUBKEYS = [s.strip() for s in
+                    os.environ.get("VOUCH_OPERATOR_PUBKEYS", "").split(",")
+                    if s.strip()]
+try:
+    MIN_TIERS = json.loads(os.environ.get("VOUCH_MIN_TIERS", "{}"))
+except json.JSONDecodeError:
+    raise ValueError("VOUCH_MIN_TIERS is not valid JSON")
+if not isinstance(MIN_TIERS, dict):
+    raise ValueError("VOUCH_MIN_TIERS must be a JSON object "
+                     "{action_pattern: minimum_tier}")
 MAX_BODY = 1024 * 1024
 
 
@@ -89,11 +103,19 @@ class VerifierState:
         self._nonces = {}          # nonce -> expiry ts
         self._agent_usage = {}     # (agent_pubkey, action_type, day) -> count
         self._principal_usage = {}  # (principal_pubkey, day) -> count
+        # Phase 11: spending ceilings, keyed (credential_id, action_type,
+        # day) -> cents used. Only actions with amount_cents add to it.
+        self._spending = {}
 
     def _prune(self, now):
         for n, exp in list(self._nonces.items()):
             if exp <= now:
                 del self._nonces[n]
+
+    def nonce_seen(self, nonce):
+        """Membership test for the v2 replay check (read-only)."""
+        with self._lock:
+            return nonce in self._nonces
 
     def check_and_reserve(self, nonce, now):
         """Replay check. Returns True if the nonce is fresh (and reserves it)."""
@@ -123,6 +145,31 @@ class VerifierState:
             k2 = (principal_pubkey, day)
             self._principal_usage[k2] = self._principal_usage.get(k2, 0) + 1
 
+    def spending_used(self, credential_id, action_type, day):
+        """Cents already spent under the spending ceiling (read-only)."""
+        with self._lock:
+            return self._spending.get((credential_id, action_type, day), 0)
+
+    def check_and_add_spending(self, credential_id, action_type, day,
+                               amount_cents, ceiling_cents):
+        """Atomic spend check+increment under the state lock.
+
+        Returns (ok, used). ok False means used + amount_cents would exceed
+        the ceiling — nothing was added (no TOCTOU between the verifier's
+        read and this write). Stale day buckets are pruned so the table
+        stays bounded to the active day.
+        """
+        with self._lock:
+            for k in [k for k in self._spending if k[2] != day]:
+                del self._spending[k]
+            k = (credential_id, action_type, day)
+            used = self._spending.get(k, 0)
+            if (ceiling_cents is not None and
+                    used + amount_cents > ceiling_cents):
+                return False, used
+            self._spending[k] = used + amount_cents
+            return True, used + amount_cents
+
 
 STATE = VerifierState()
 EMITTER = None  # set in main()
@@ -130,25 +177,32 @@ EMITTER = None  # set in main()
 
 def decide(req):
     """Core decision logic (pure apart from STATE). Returns
-    (decision, reason, lane, cred_or_None)."""
+    (decision, reason, lane, cred_or_None, evidence_or_None).
+
+    evidence is the v2 enrollment-evidence dict (receipt vouch_enrollment
+    block); None on the v1 path.
+    """
     now = time.time()
     tenant_id = req.get("tenant_id", "default")
     cred = req.get("credential") or {}
     action = req.get("action") or {}
     atype = action.get("type", "")
 
+    if MANIFEST_PATH:
+        return _decide_v2(req, now, tenant_id, cred, action, atype)
+
     # Replay is checked before anything else: a replayed request is denied
     # even if it would otherwise verify (it also must not consume quota).
     nonce = req.get("nonce")
     if not nonce or not STATE.check_and_reserve(nonce, now):
         return ("deny", "replay: nonce already seen", "unverified",
-                cred if isinstance(cred, dict) else None)
+                cred if isinstance(cred, dict) else None, None)
 
     ok, reasons = credentials.verify_action_request(
         req, TRUSTED_ISSUERS, now=now, usage=_UsageView(STATE))
     if not ok:
         return ("deny", "; ".join(reasons), "unverified",
-                cred if isinstance(cred, dict) else None)
+                cred if isinstance(cred, dict) else None, None)
 
     # Per-principal daily rate limit (the verified-agent lane's throttle).
     day = time.strftime("%Y-%m-%d", time.gmtime(now))
@@ -157,11 +211,73 @@ def decide(req):
     if used >= PRINCIPAL_DAILY_LIMIT:
         return ("deny",
                 f"principal rate limit exceeded: {used}/{PRINCIPAL_DAILY_LIMIT}/day",
-                "unverified", cred)
+                "unverified", cred, None)
 
     STATE.record_allow(cred["agent_pubkey"], principal_pubkey, atype, day)
     return ("allow", "credential valid; action within scope",
-            "verified-agent", cred)
+            "verified-agent", cred, None)
+
+
+def _decide_v2(req, now, tenant_id, cred, action, atype):
+    """v2 path: enrollment-anchored verification (PRD check order).
+
+    Returns the same 5-tuple as decide(); evidence is the 7-field
+    enrollment block (or None on deny, where the receipt omits it).
+    """
+    try:
+        # Manifest is loaded fresh per request — no stale-cache TOCTOU:
+        # a revoked key/credential takes effect on the next rebuild.
+        with open(MANIFEST_PATH, encoding="utf-8") as f:
+            manifest = json.load(f)
+    except Exception:
+        # Fail closed: no trust root -> deny (no details leak).
+        return ("deny", "trust root stale: manifest file unreadable",
+                "unverified", cred if isinstance(cred, dict) else None,
+                None)
+
+    hook = credentials.default_tier_policy(MIN_TIERS)
+    ok, reasons, evidence = credentials.verify_action_request_v2(
+        req, manifest=manifest, operator_pubkeys=OPERATOR_PUBKEYS,
+        policy_hook=hook, now=now, nonces=_NoncesView(STATE),
+        usage=_UsageView(STATE), spending=_SpendingView(STATE))
+    if not ok:
+        return ("deny", "; ".join(reasons), "unverified",
+                cred if isinstance(cred, dict) else None, None)
+
+    # v2 only reads the nonce store; reserve it now that the request is
+    # good. A racing duplicate that slips the read is denied here.
+    nonce = req.get("nonce")
+    if not nonce or not STATE.check_and_reserve(nonce, now):
+        return ("deny", "replayed request", "unverified",
+                cred if isinstance(cred, dict) else None, None)
+
+    # Per-principal daily rate limit (the verified-agent lane's throttle).
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    principal_pubkey = cred["principal"]["pubkey"]
+    used = STATE.principal_used(principal_pubkey, day)
+    if used >= PRINCIPAL_DAILY_LIMIT:
+        return ("deny",
+                f"principal rate limit exceeded: {used}/{PRINCIPAL_DAILY_LIMIT}/day",
+                "unverified", cred, None)
+
+    # Spending ceiling: atomic check+increment (no TOCTOU). The verifier
+    # already read-checked the ceiling; this is the authoritative gate.
+    amount = action.get("amount_cents") or 0
+    lim = (credentials._norm_scope(cred.get("scope"))
+           .get("limits", {}).get(atype, {}))
+    ceiling = lim.get("max_spend_per_day")
+    if amount and ceiling is not None:
+        ok_spend, used_cents = STATE.check_and_add_spending(
+            cred["credential_id"], atype, day, amount, ceiling)
+        if not ok_spend:
+            return ("deny",
+                    f"spending ceiling exceeded: "
+                    f"{used_cents + amount}/{ceiling} {atype}/day (cents)",
+                    "unverified", cred, None)
+
+    STATE.record_allow(cred["agent_pubkey"], principal_pubkey, atype, day)
+    return ("allow", "credential valid; action within scope",
+            "verified-agent", cred, evidence)
 
 
 class _UsageView:
@@ -173,6 +289,27 @@ class _UsageView:
     def get(self, key, default=0):
         agent_pubkey, atype, day = key
         return self._state.agent_used(agent_pubkey, atype, day)
+
+
+class _NoncesView:
+    """Read-only membership view of STATE's reserved nonces (v2 replay)."""
+
+    def __init__(self, state):
+        self._state = state
+
+    def __contains__(self, nonce):
+        return self._state.nonce_seen(nonce)
+
+
+class _SpendingView:
+    """Read-only adapter for STATE's spending counters (v2 ceilings)."""
+
+    def __init__(self, state):
+        self._state = state
+
+    def get(self, key, default=0):
+        credential_id, atype, day = key
+        return self._state.spending_used(credential_id, atype, day)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -247,20 +384,25 @@ class Handler(BaseHTTPRequestHandler):
                              "message": "body must be a JSON object"})
             return
 
-        decision, reason, lane, cred = decide(req)
+        decision, reason, lane, cred, evidence = decide(req)
 
         # Every decision emits a signed, hash-chained receipt — this is the
         # demand-side audit trail: proof of what was checked and decided.
         agent_id = (cred or {}).get("agent_id", "unknown")
         task_id = (cred or {}).get("credential_id", "no-credential")
+        receipt_args = {"action": req.get("action"),
+                        "credential_id": task_id,
+                        "lane": lane}
+        if evidence:
+            # Phase 11: enrollment evidence rides in the receipt args block
+            # (v2 path only; the v1 path is unchanged).
+            receipt_args["vouch_enrollment"] = evidence
         receipt = EMITTER.emit(
             tenant_id=req.get("tenant_id", "default"),
             task_id=task_id,
             agent_id=agent_id,
             tool="agent.verify",
-            args={"action": req.get("action"),
-                  "credential_id": task_id,
-                  "lane": lane},
+            args=receipt_args,
             decision=decision,
             reason=reason,
         )
