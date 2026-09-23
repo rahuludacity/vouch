@@ -5,6 +5,7 @@ ports (in-process, threaded) and drives them as an MCP client would:
 initialize handshake, session relay, SSE/JSON negotiation, tools/call
 gating, GET streams, DELETE termination.
 """
+import io
 import json
 import os
 import sys
@@ -147,7 +148,9 @@ class TransportTest(unittest.TestCase):
         self.assertTrue(session)
         self.assertEqual(msgs[0]["result"]["protocolVersion"], "2025-06-18")
 
-    def test_notification_returns_202_empty(self):
+    def test_unlisted_notification_denied_not_forwarded(self):
+        # C-1: a notification whose method the policy does not explicitly
+        # permit is DENIED (403), never silently forwarded upstream.
         session, _ = self.initialize()
         status, _, body = raw_request(
             "POST", json.dumps({"jsonrpc": "2.0", "method": "ping"}).encode(),
@@ -155,8 +158,11 @@ class TransportTest(unittest.TestCase):
              "Accept": "application/json, text/event-stream",
              "X-Tenant-Id": "acme", "Mcp-Session-Id": session},
         )
-        self.assertEqual(status, 202)
-        self.assertEqual(body, b"")
+        self.assertEqual(status, 403)
+        obj = json.loads(body.decode())
+        self.assertEqual(obj["error"], "notification_not_permitted")
+        # the gatekeeper answered 403 itself: forwarding always yields
+        # 202 + empty body, so a JSON error body proves no forward.
 
     # ---- tools ----
     def test_tools_list_passthrough(self):
@@ -296,6 +302,153 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, 404)
 
 
+
+
+class NotificationGateTest(unittest.TestCase):
+    """C-1: notification-shaped `tools/call` must be policy-gated (fail closed).
+
+    Regression tests for the bypass where any JSON-RPC object with
+    "method" and no "id" was forwarded upstream with no policy evaluation,
+    no receipt, and no accounting. Uses a stubbed Handler (no network):
+    the event log proves exactly which path each message took.
+    """
+
+    def _policy(self):
+        return Policy(
+            {"task1": {"version": 1,
+                       "allow": [Rule.from_dict({"rule_id": "r1",
+                                                 "tool": "read_file"})],
+                       "deny": []}},
+            version=1,
+            allow_notifications=["notifications/initialized"])
+
+    def _handler(self, events):
+        h = object.__new__(proxy.Handler)
+        h.policy = self._policy()  # instance attr shadows the class policy
+
+        class Emitter:
+            def emit(self, **kw):
+                events.append(("emit", kw["decision"], kw["tool"]))
+                return {"seq": len(events)}
+
+        class FakeUpstream:
+            headers = {}
+            def close(self):
+                pass
+
+        h.emitter = Emitter()
+        h._upstream_request = lambda *a, **k: (
+            events.append(("upstream", json.loads(a[1].decode("utf-8"))))
+            or FakeUpstream())
+        h._relay_response = lambda up: events.append(("relay",)) or (None, None)
+        h._bind_session = lambda sid, tid: events.append(("bind",))
+        h._send_rpc = lambda msg, session_id=None: events.append(
+            ("send_rpc", msg))
+        h._send_empty = lambda code, session_id=None: events.append(
+            ("send_empty", code))
+        h._send = lambda code, obj, **k: events.append(("send", code, obj))
+        return h
+
+    def _do_post(self, h, body, headers=None):
+        raw = json.dumps(body).encode("utf-8")
+        h.path = "/mcp"
+        h.command = "POST"
+        h.headers = {"Content-Length": str(len(raw)),
+                     "Content-Type": "application/json",
+                     "Accept": "application/json",
+                     "X-Tenant-Id": "acme",
+                     "X-Task-Id": "task1",
+                     "X-Agent-Id": "agent-1",
+                     **(headers or {})}
+        h.rfile = io.BytesIO(raw)
+        h.do_POST()
+
+    def _kinds(self, events):
+        return [e[0] for e in events]
+
+    def test_notification_tools_call_allowed_is_gated_then_forwarded(self):
+        # Allowed tool, no "id": full policy evaluation (allow + receipt)
+        # happens BEFORE any upstream forward — never a silent forward.
+        events = []
+        h = self._handler(events)
+        body = {"jsonrpc": "2.0", "method": "tools/call",
+                "params": {"name": "read_file", "arguments": {"path": "x"}}}
+        self._do_post(h, body)
+        kinds = self._kinds(events)
+        self.assertEqual(kinds, ["emit", "upstream", "relay", "bind"])
+        self.assertEqual(events[0], ("emit", "allow", "read_file"))
+        # the forwarded bytes are the original notification, byte-identical
+        self.assertEqual(events[1][1], body)
+
+    def test_notification_tools_call_denied_never_forwarded(self):
+        # Denied tool, no "id": deny receipt + explicit JSON-RPC error,
+        # and the upstream is never touched.
+        events = []
+        h = self._handler(events)
+        self._do_post(h, {"jsonrpc": "2.0", "method": "tools/call",
+                           "params": {"name": "delete_database",
+                                      "arguments": {}}})
+        kinds = self._kinds(events)
+        self.assertIn(("emit", "deny", "delete_database"), events)
+        self.assertNotIn("upstream", kinds)
+        self.assertNotIn("relay", kinds)
+        send_rpcs = [e[1] for e in events if e[0] == "send_rpc"]
+        self.assertEqual(len(send_rpcs), 1)
+        err = send_rpcs[0]
+        self.assertIsNone(err["id"])  # notification: no id to echo
+        self.assertEqual(err["error"]["code"], -32000)
+        self.assertIn("policy denied", err["error"]["message"])
+
+    def test_notification_tools_call_unknown_task_denied(self):
+        # No X-Task-Id: fail closed, not forwarded.
+        events = []
+        h = self._handler(events)
+        raw = json.dumps({"jsonrpc": "2.0", "method": "tools/call",
+                          "params": {"name": "read_file",
+                                     "arguments": {}}}).encode()
+        h.path = "/mcp"
+        h.headers = {"Content-Length": str(len(raw)),
+                     "Content-Type": "application/json",
+                     "Accept": "application/json",
+                     "X-Tenant-Id": "acme",
+                     "X-Agent-Id": "agent-1"}  # no X-Task-Id on purpose
+        h.rfile = io.BytesIO(raw)
+        h.do_POST()
+        kinds = self._kinds(events)
+        self.assertIn(("emit", "deny", "read_file"), events)
+        self.assertNotIn("upstream", kinds)
+
+    def test_unlisted_notification_denied(self):
+        events = []
+        h = self._handler(events)
+        self._do_post(h, {"jsonrpc": "2.0", "method": "ping"})
+        sends = [e for e in events if e[0] == "send"]
+        self.assertEqual(len(sends), 1)
+        _, code, obj = sends[0]
+        self.assertEqual(code, 403)
+        self.assertEqual(obj["error"], "notification_not_permitted")
+        self.assertNotIn("upstream", self._kinds(events))
+
+    def test_allowlisted_notification_forwarded_202(self):
+        events = []
+        h = self._handler(events)
+        self._do_post(h, {"jsonrpc": "2.0",
+                           "method": "notifications/initialized"})
+        kinds = self._kinds(events)
+        self.assertIn("upstream", kinds)
+        self.assertIn(("send_empty", 202), events)
+        self.assertNotIn("emit", kinds)  # no receipt for plain notifications
+
+    def test_client_response_still_forwarded(self):
+        # id + result is a client response, not a tool call: passthrough
+        # semantics are unchanged.
+        events = []
+        h = self._handler(events)
+        self._do_post(h, {"jsonrpc": "2.0", "id": 7, "result": {"ok": True}})
+        kinds = self._kinds(events)
+        self.assertIn("upstream", kinds)
+        self.assertIn(("send_empty", 202), events)
+        self.assertNotIn("emit", kinds)
 
 
 class M4OrderingTest(unittest.TestCase):

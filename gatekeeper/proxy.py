@@ -15,7 +15,11 @@ Speaks real MCP Streamable HTTP (spec.modelcontextprotocol.io):
 
 Policy enforcement is unchanged from v0: only `tools/call` is gated,
 checked against policy.yaml for the X-Task-Id scope. Every allow AND
-deny emits a receipt signed with the calling tenant's HMAC key.
+deny emits a receipt signed with the calling tenant's HMAC key. A
+notification-shaped `tools/call` (no JSON-RPC "id") is gated exactly
+like the id-carrying form (C-1 fail closed); other notifications are
+forwarded ONLY when the policy's top-level `allow_notifications`
+explicitly lists the method — default deny.
 
 Tenant identification:
   - Control-plane mode (CONTROLPLANE_URL set): the caller MUST present the
@@ -416,7 +420,35 @@ class Handler(BaseHTTPRequestHandler):
         is_notification = "method" in req and "id" not in req
         is_response = "id" in req and ("result" in req or "error" in req)
 
+        agent_id = self.headers.get("X-Agent-Id", "unknown")
+        task_id = self.headers.get("X-Task-Id")
+
+        if method == "tools/call" and is_notification:
+            # C-1 fail closed: a notification-shaped tools/call gets the
+            # FULL policy evaluation path (decision + signed receipt +
+            # upstream forward on allow), exactly like the id-carrying
+            # form — never a silent forward. req_id is None, so a deny
+            # rides _send_rpc as an id:null JSON-RPC error instead of a
+            # misleading 202.
+            return self._handle_tools_call(req, req_id, tenant_id, agent_id,
+                                           task_id)
+
         if is_notification or is_response:
+            if is_notification:
+                # C-1: genuine notifications keep notification semantics
+                # ONLY when the policy explicitly permits the method via
+                # allow_notifications; default deny for anything the
+                # policy doesn't recognize.
+                if CP_ACTIVE and self._is_suspended(tenant_id):
+                    return self._send(403, {"error": "tenant suspended"})
+                if not self._policy_for(tenant_id).notification_allowed(method):
+                    print(f"[DENY] tenant={tenant_id} task={task_id} "
+                          f"agent={agent_id} notification method={method!r} "
+                          f"not in allow_notifications")
+                    return self._send(
+                        403, {"error": "notification_not_permitted",
+                              "message": f"method '{method}' is not permitted "
+                                         "as a notification"})
             # Nothing to gate and no reply expected: forward, answer 202.
             up = self._upstream_request("POST", json.dumps(req).encode("utf-8"))
             if isinstance(up, tuple):
@@ -425,9 +457,6 @@ class Handler(BaseHTTPRequestHandler):
             up.close()
             self._bind_session(session_id, tenant_id)
             return self._send_empty(202, session_id)
-
-        agent_id = self.headers.get("X-Agent-Id", "unknown")
-        task_id = self.headers.get("X-Task-Id")
 
         if method == "initialize":
             up = self._upstream_request("POST", json.dumps(req).encode("utf-8"))

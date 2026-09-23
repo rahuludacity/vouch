@@ -1,5 +1,15 @@
 # Task-scoped capabilities: each task gets ONLY the tools it needs.
 # Anything not listed is denied and the denial itself gets a signed receipt.
+#
+# allow_notifications (C-1): JSON-RPC methods that may be forwarded as
+# notifications (no "id"). `tools/call` NEVER takes this path — a
+# notification-shaped tools/call always gets full policy evaluation.
+# Any notification whose method is not listed here is DENIED (403).
+# "notifications/initialized" is listed because the MCP spec requires
+# clients to send it after the initialize handshake; it carries no
+# sensitive payload.
+allow_notifications:
+  - notifications/initialized
 tasks:
   deploy-staging:
     agent: "agent-001"
