@@ -26,8 +26,13 @@ import copy
 import hashlib
 import json
 import os
+import re
+import secrets
+import subprocess
 import threading
 import time
+import urllib.parse
+import urllib.request
 
 from . import ed25519
 from .credentials import canonical
@@ -849,3 +854,447 @@ def enroll_principal_tier0(*, log, principal_id, pubkey_hex, label,
     )
     manifest_entry = _new_principal_entry(payload, entry["seq"])
     return cert, manifest_entry
+
+
+# ---------------------------------------------------------------- Tier 1: DNS challenge + domain-control enrollment
+#
+# Phase 10 — Tier 1 ("domain-control"). A principal proves control of a
+# domain by publishing a random token as a DNS TXT record at
+# _vouch-challenge.<domain>, and by serving the enrolling key in the
+# domain's /.well-known/vouch-keys JWKS directory (Phase 12 shape).
+#
+# This binds the principal to domain control, nothing more. It says
+# nothing about who the principal is — the tier string and every
+# user-facing message say exactly that.
+#
+# Prototype honesty: the DNS check runs over the system resolver with
+# no DNSSEC validation. A network-path attacker who can spoof your DNS
+# can spoof this check. Tier 1 proves domain control against casual
+# attackers only. The HTTPS fetch likewise trusts the system TLS stack
+# (no pinning in this prototype).
+#
+# Network access is injectable everywhere: tests pass stubs, the
+# operator console passes the real fetchers.
+
+_CHALLENGE_LABEL = "_vouch-challenge"
+_MAX_JWKS_BYTES = 1 << 20          # 1 MiB cap on fetched key directories
+_MAX_REASON_LEN = 256
+
+# A DNS label: alphanumerics plus interior hyphens, 1-63 chars.
+_DNS_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def _check_domain(domain):
+    """Validate a DNS domain name; return it normalized.
+
+    Raises ValueError on anything that is not plain DNS (scheme, path,
+    whitespace, control chars, userinfo are all rejected here).
+    """
+    if not isinstance(domain, str) or not domain:
+        raise ValueError("domain must be a non-empty string")
+    d = domain.strip().rstrip(".")
+    if not d or len(d) > 253:
+        raise ValueError("domain is empty or too long")
+    labels = d.split(".")
+    for lab in labels:
+        if not _DNS_LABEL_RE.match(lab):
+            raise ValueError(f"domain has a bad label: {lab!r}")
+    return d.lower()
+
+
+def create_dns_challenge(domain):
+    """Mint a DNS-01 style challenge for a domain.
+
+    Returns {"domain","token","txt_name","created_at"} where token is a
+    256-bit value (64 hex chars) from the secrets module and txt_name is
+    "_vouch-challenge." + domain. The principal proves domain control
+    by publishing the token as a TXT record at txt_name.
+    """
+    d = _check_domain(domain)
+    token = secrets.token_hex(32)
+    return {
+        "domain": d,
+        "token": token,
+        "txt_name": _CHALLENGE_LABEL + "." + d,
+        "created_at": _ts(),
+    }
+
+
+def _unquote_txt(line):
+    """Strip DNS TXT quoting: join "chunk" segments into one string."""
+    if not isinstance(line, str):
+        return ""
+    chunks = re.findall(r'"([^"]*)"', line)
+    if chunks:
+        return "".join(chunks)
+    return line.strip()
+
+
+def verify_dns_challenge(challenge, fetch_txt):
+    """Check the challenge token against live TXT records.
+
+    fetch_txt(txt_name) -> [str] is injectable. Returns (ok, reason);
+    never raises — every doubt (bad challenge shape, lookup failure,
+    missing token) fails closed.
+    """
+    try:
+        if not isinstance(challenge, dict):
+            return False, "challenge is not an object"
+        domain = challenge.get("domain")
+        token = challenge.get("token")
+        txt_name = challenge.get("txt_name")
+        if not (isinstance(domain, str) and domain):
+            return False, "challenge has no domain"
+        if not (isinstance(token, str) and token):
+            return False, "challenge has no token"
+        if txt_name != _CHALLENGE_LABEL + "." + domain:
+            return False, "challenge txt_name does not match its domain"
+        if not callable(fetch_txt):
+            return False, "fetch_txt is not callable"
+        try:
+            records = fetch_txt(txt_name)
+        except Exception as exc:
+            # Class name only — the underlying message may carry
+            # resolver/network detail we do not want in deny reasons.
+            return False, f"TXT lookup failed ({exc.__class__.__name__})"
+        if not isinstance(records, (list, tuple)):
+            return False, "fetch_txt did not return a list of records"
+        seen = []
+        for r in records:
+            if isinstance(r, bytes):
+                try:
+                    r = r.decode("utf-8", "replace")
+                except Exception:
+                    continue
+            if isinstance(r, str):
+                seen.append(_unquote_txt(r))
+        if token in seen:
+            return True, "token present in TXT records"
+        if not seen:
+            return False, "no TXT records found at the challenge name"
+        return False, "token not present in TXT records"
+    except Exception:
+        return False, "challenge verification hit an unexpected error"
+
+
+def fetch_txt_via_dig(txt_name, timeout_s=10):
+    """Resolve TXT records with the system `dig` binary.
+
+    Real fetcher for the operator console; tests inject stubs instead.
+    Never raises — any failure (bad name, missing dig, timeout, parse
+    error) returns [], which fails the challenge check closed. Args are
+    passed as a list (no shell). See the section docstring for the
+    plain-language trust caveat: this trusts the system resolver, no
+    DNSSEC.
+    """
+    try:
+        if not isinstance(txt_name, str):
+            return []
+        name = txt_name.strip().rstrip(".")
+        if not name or len(name) > 253:
+            return []
+        for lab in name.split("."):
+            # The challenge label starts with an underscore, which is
+            # legal for DNS TXT owner names (RFC 8555 style).
+            stripped = lab.lstrip("_")
+            if not _DNS_LABEL_RE.match(stripped or "_"):
+                return []
+        proc = subprocess.run(
+            ["dig", "+short", "TXT", name],
+            capture_output=True, text=True,
+            timeout=timeout_s, check=False)
+        out = proc.stdout or ""
+    except Exception:
+        return []
+    records = []
+    for line in out.splitlines():
+        txt = _unquote_txt(line)
+        if txt:
+            records.append(txt)
+    return records
+
+
+def fetch_https_json(url, timeout_s=10):
+    """GET a URL and parse the body as JSON. Raises ValueError on failure.
+
+    Hardened for the console's future use: https scheme only (no
+    scheme/host injection — userinfo/@ is rejected), 10s timeout, 1 MiB
+    response cap, strict JSON parse. Callers treat a raise as "not
+    proven" and fail closed. Redirects are followed only while the
+    final URL stays https.
+    """
+    try:
+        parts = urllib.parse.urlparse(url)
+    except Exception:
+        raise ValueError("https fetch failed: malformed URL")
+    if parts.scheme != "https":
+        raise ValueError("https fetch failed: only https is allowed")
+    if not parts.hostname:
+        raise ValueError("https fetch failed: URL has no host")
+    if "@" in parts.netloc:
+        raise ValueError("https fetch failed: userinfo not allowed")
+    try:
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            if urllib.parse.urlparse(resp.geturl()).scheme != "https":
+                raise ValueError("redirect left https")
+            body = resp.read(_MAX_JWKS_BYTES + 1)
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError(
+            f"https fetch failed for host {parts.hostname}")
+    if len(body) > _MAX_JWKS_BYTES:
+        raise ValueError("https fetch failed: response exceeds size cap")
+    try:
+        return json.loads(body.decode("utf-8"))
+    except Exception:
+        raise ValueError("https fetch failed: response is not JSON")
+
+
+def _require_pubkey_in_jwks(jwks, pubkey_hex):
+    """Fail-closed check: the enrolling key must appear in the JWKS dict.
+
+    A key entry matches when its "kid" equals the key's JWK thumbprint
+    (the Phase 12 kid convention) OR its "x" equals the base64url of the
+    raw public key bytes. Raises ValueError when the directory is
+    malformed or the key is absent.
+    """
+    if not isinstance(jwks, dict):
+        raise ValueError("key directory is not a JSON object")
+    keys = jwks.get("keys")
+    if not isinstance(keys, list):
+        raise ValueError("key directory has no 'keys' list")
+    if len(keys) > 4096:
+        raise ValueError("key directory lists an absurd number of keys")
+    want_kid = jwk_thumbprint(pubkey_hex)
+    want_x = _b64url_nopad(bytes.fromhex(pubkey_hex))
+    for entry in keys:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("kid") == want_kid:
+            return
+        if entry.get("x") == want_x:
+            return
+    raise ValueError("enrolling key not present in the domain key directory")
+
+
+def _current_principals(log):
+    """Fold the log to today's principal state (raises ValueError if bad)."""
+    principals, _ = _fold_log_into_principals(log.entries())
+    return principals
+
+
+def enroll_principal_tier1(*, log, principal_id, domain, pubkey_hex, label,
+                           challenge, fetch_txt, fetch_https,
+                           operator_priv_hex, operator_pub_hex,
+                           issued_at=None):
+    """Enroll one principal at Tier 1 ("domain-control").
+
+    Steps, all fail-closed:
+      1. verify the DNS challenge (raises on failure),
+      2. fetch https://<domain>/.well-known/vouch-keys (raises on failure),
+      3. require the enrolling pubkey to be listed in that JWKS,
+      4. append the "enroll" event (tier "domain-control", domain set)
+         and issue the enrollment certificate pointing at that log seq.
+
+    fetch_txt(txt_name) -> [str] and fetch_https(url) -> dict are
+    injectable; the console passes fetch_txt_via_dig / fetch_https_json.
+
+    Returns (cert, manifest_entry). Raises ValueError on any failure —
+    nothing half-enrolled ever happens.
+    """
+    if not isinstance(log, TransparencyLog):
+        raise ValueError("log must be a TransparencyLog")
+    _check_id(principal_id, "principal_id", _MAX_ID_LEN)
+    d = _check_domain(domain)
+    _check_id(label, "label", _MAX_LABEL_LEN)
+    _check_hex32(pubkey_hex, "pubkey_hex")
+    op_pub = _check_hex32(operator_pub_hex, "operator_pub_hex").hex()
+    if op_pub != _operator_pubkey_from_priv(operator_priv_hex):
+        raise ValueError("operator_pub_hex does not match operator_priv_hex")
+    if not isinstance(challenge, dict):
+        raise ValueError("challenge must be a dict")
+    if challenge.get("domain") != d:
+        raise ValueError("challenge was not created for this domain")
+    ok, reason = verify_dns_challenge(challenge, fetch_txt)
+    if not ok:
+        raise ValueError(f"domain control check failed: {reason}")
+    if not callable(fetch_https):
+        raise ValueError("fetch_https is not callable")
+    url = "https://" + d + "/.well-known/vouch-keys"
+    try:
+        jwks = fetch_https(url)
+    except Exception as exc:
+        raise ValueError(
+            f"key directory fetch failed ({exc.__class__.__name__})")
+    _require_pubkey_in_jwks(jwks, pubkey_hex)
+
+    key_id = jwk_thumbprint(pubkey_hex)
+    now = _ts(issued_at)
+    payload = {
+        "principal_id": principal_id,
+        "tier": TIER_DOMAIN_CONTROL,
+        "domain": d,
+        "keys": [{"key_id": key_id, "pubkey": pubkey_hex, "label": label}],
+        "enrolled_at": now,
+        "expires_at": round(now + ENROLLMENT_TTL_S, 3),
+    }
+    entry = log.append("enroll", payload, operator_priv_hex, ts=now)
+    cert = issue_enrollment_certificate(
+        principal_id=principal_id,
+        tier=TIER_DOMAIN_CONTROL,
+        domain=d,
+        key_ids=[{"key_id": key_id, "pubkey": pubkey_hex,
+                  "label": label, "status": "active"}],
+        operator_priv_hex=operator_priv_hex,
+        operator_pub_hex=op_pub,
+        log_seq=entry["seq"],
+        ttl_s=ENROLLMENT_TTL_S,
+        issued_at=now,
+    )
+    manifest_entry = _new_principal_entry(payload, entry["seq"])
+    return cert, manifest_entry
+
+
+# ---------------------------------------------------------------- key lifecycle (Phase 10)
+def rotate_key(*, log, principal_id, old_pubkey_hex, new_pubkey_hex, label,
+               operator_priv_hex, overlap_s=ROTATION_OVERLAP_S,
+               issued_at=None):
+    """Rotate a principal's key with a grace overlap.
+
+    Appends the frozen "rotate" payload:
+        {"principal_id","old_key_id",
+         "new_key":{"key_id","pubkey","label"},
+         "rotated_at","overlap_s"}
+    The old key becomes "superseded" and stays usable until
+    rotated_at + overlap_s (default 72h) so in-flight credentials keep
+    working. The old key must currently be active; the new key must not
+    already be enrolled. Returns the appended log entry.
+    """
+    if not isinstance(log, TransparencyLog):
+        raise ValueError("log must be a TransparencyLog")
+    _check_id(principal_id, "principal_id", _MAX_ID_LEN)
+    _check_hex32(old_pubkey_hex, "old_pubkey_hex")
+    _check_hex32(new_pubkey_hex, "new_pubkey_hex")
+    _check_id(label, "label", _MAX_LABEL_LEN)
+    if old_pubkey_hex.lower() == new_pubkey_hex.lower():
+        raise ValueError("new key must differ from the old key")
+    if (not isinstance(overlap_s, (int, float))
+            or isinstance(overlap_s, bool) or overlap_s <= 0):
+        raise ValueError("overlap_s must be a positive number")
+    if overlap_s > 30 * 24 * 3600:
+        raise ValueError("overlap_s is absurdly long (cap: 30 days)")
+    principals = _current_principals(log)
+    entry = principals.get(principal_id)
+    if entry is None:
+        raise ValueError("rotate for unknown principal")
+    if entry["status"] != "active":
+        raise ValueError("cannot rotate a key of a non-active principal")
+    old_kid = jwk_thumbprint(old_pubkey_hex)
+    old = next((k for k in entry["keys"] if k["key_id"] == old_kid), None)
+    if old is None:
+        raise ValueError("old key is not enrolled for this principal")
+    if old["status"] != "active":
+        raise ValueError("old key is not active")
+    new_kid = jwk_thumbprint(new_pubkey_hex)
+    if any(k["key_id"] == new_kid for k in entry["keys"]):
+        raise ValueError("new key is already enrolled for this principal")
+    now = _ts(issued_at)
+    payload = {
+        "principal_id": principal_id,
+        "old_key_id": old_kid,
+        "new_key": {"key_id": new_kid, "pubkey": new_pubkey_hex,
+                    "label": label},
+        "rotated_at": now,
+        "overlap_s": overlap_s,
+    }
+    return log.append("rotate", payload, operator_priv_hex, ts=now)
+
+
+def revoke_key(*, log, principal_id, pubkey_hex, reason,
+               operator_priv_hex, issued_at=None):
+    """Revoke one of a principal's keys, effective immediately.
+
+    Appends the frozen "revoke-key" payload:
+        {"principal_id","key_id","revoked_at","reason"}
+    Revocation is permanent — a revoked key never becomes usable again
+    (use rotate_key to move to a new key). Returns the appended entry.
+    """
+    if not isinstance(log, TransparencyLog):
+        raise ValueError("log must be a TransparencyLog")
+    _check_id(principal_id, "principal_id", _MAX_ID_LEN)
+    _check_hex32(pubkey_hex, "pubkey_hex")
+    _check_id(reason, "reason", _MAX_REASON_LEN)
+    principals = _current_principals(log)
+    entry = principals.get(principal_id)
+    if entry is None:
+        raise ValueError("revoke-key for unknown principal")
+    kid = jwk_thumbprint(pubkey_hex)
+    key = next((k for k in entry["keys"] if k["key_id"] == kid), None)
+    if key is None:
+        raise ValueError("revoke-key for a key not enrolled for this principal")
+    if key["status"] == "revoked":
+        raise ValueError("key is already revoked")
+    payload = {
+        "principal_id": principal_id,
+        "key_id": kid,
+        "revoked_at": _ts(issued_at),
+        "reason": reason,
+    }
+    return log.append("revoke-key", payload, operator_priv_hex,
+                      ts=payload["revoked_at"])
+
+
+def suspend_principal(*, log, principal_id, reason,
+                      operator_priv_hex, issued_at=None):
+    """Suspend a principal: all its keys report "suspended" in the fold.
+
+    Appends the frozen "suspend" payload:
+        {"principal_id","suspended_at","reason"}
+    Returns the appended log entry.
+    """
+    if not isinstance(log, TransparencyLog):
+        raise ValueError("log must be a TransparencyLog")
+    _check_id(principal_id, "principal_id", _MAX_ID_LEN)
+    _check_id(reason, "reason", _MAX_REASON_LEN)
+    principals = _current_principals(log)
+    entry = principals.get(principal_id)
+    if entry is None:
+        raise ValueError("suspend for unknown principal")
+    if entry["status"] == "suspended":
+        raise ValueError("principal is already suspended")
+    payload = {
+        "principal_id": principal_id,
+        "suspended_at": _ts(issued_at),
+        "reason": reason,
+    }
+    return log.append("suspend", payload, operator_priv_hex,
+                      ts=payload["suspended_at"])
+
+
+def unsuspend_principal(*, log, principal_id, operator_priv_hex,
+                        issued_at=None):
+    """Lift a suspension: the principal's status returns to "active".
+
+    Appends the frozen "unsuspend" payload:
+        {"principal_id","unsuspended_at"}
+    Keys revoked or superseded while suspended stay that way — only the
+    principal-level status is restored. Returns the appended log entry.
+    """
+    if not isinstance(log, TransparencyLog):
+        raise ValueError("log must be a TransparencyLog")
+    _check_id(principal_id, "principal_id", _MAX_ID_LEN)
+    principals = _current_principals(log)
+    entry = principals.get(principal_id)
+    if entry is None:
+        raise ValueError("unsuspend for unknown principal")
+    if entry["status"] != "suspended":
+        raise ValueError("principal is not suspended")
+    payload = {
+        "principal_id": principal_id,
+        "unsuspended_at": _ts(issued_at),
+    }
+    return log.append("unsuspend", payload, operator_priv_hex,
+                      ts=payload["unsuspended_at"])
