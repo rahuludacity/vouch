@@ -36,16 +36,21 @@ Env:
     VERIFIER_TRUSTED_ISSUERS    comma-separated Ed25519 pubkey hex
                                 (the principals this site trusts)
     VERIFIER_PRINCIPAL_DAILY_LIMIT  default 1000
+    VERIFIER_STATE_DIR            default <repo>/verifier-state
+                                (instance lock + durable boot floor;
+                                 see docs/deployment-constraints.md)
     RECEIPT_SVC_URL / RECEIPT_SVC_TOKEN  optional receipt-service fan-in
                                 (empty string = local file only)
 
 Run: python3 -m services.verifier.app
 """
+import fcntl
 import json
 import os
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -63,6 +68,12 @@ PORT = int(os.environ.get("VERIFIER_PORT", "9005"))
 TENANTS_PATH = os.environ.get(
     "VERIFIER_TENANTS_PATH",
     os.path.join(REPO, "tenants.json"))
+# M-1: single-instance lock + durable boot floor live here.
+STATE_DIR = os.environ.get(
+    "VERIFIER_STATE_DIR",
+    os.path.join(REPO, "verifier-state"))
+_BOOT_FILE = "verifier-boot.json"
+_LOCK_FILE = "verifier.lock"
 RECEIPTS_PATH = os.environ.get(
     "VERIFIER_RECEIPTS_PATH",
     os.path.join(REPO, "verifier-receipts.jsonl"))
@@ -89,7 +100,15 @@ MAX_BODY = 1024 * 1024
 
 
 class VerifierState:
-    """In-memory replay + rate-limit state (prototype; not durable)."""
+    """Replay + rate-limit + spend state.
+
+    M-1: the nonce/rate/spend tables are in-memory and reset on
+    restart (single-instance is enforced, so they never diverge).
+    Replay safety across restarts comes from the DURABLE BOOT FLOOR
+    (boot_ts): requests timestamped before this boot are denied, so a
+    restart can never resurrect a replay window for captured requests.
+    See docs/deployment-constraints.md for the full contract.
+    """
 
     # Hard cap on the nonce table. Nonces are reserved *before* credential
     # verification, so an attacker can grow the table with garbage requests
@@ -100,6 +119,7 @@ class VerifierState:
 
     def __init__(self):
         self._lock = threading.Lock()
+        self._boot_ts = 0.0        # durable floor: reject ts < boot_ts
         self._nonces = {}          # nonce -> expiry ts
         self._agent_usage = {}     # (agent_pubkey, action_type, day) -> count
         self._principal_usage = {}  # (principal_pubkey, day) -> count
@@ -111,6 +131,26 @@ class VerifierState:
         for n, exp in list(self._nonces.items()):
             if exp <= now:
                 del self._nonces[n]
+
+    def set_boot_ts(self, boot_ts):
+        """Set the durable boot floor (once, at startup)."""
+        with self._lock:
+            self._boot_ts = float(boot_ts)
+
+    def allows_timestamp(self, ts, now):
+        """True when ts is at/after the boot floor (replay-on-restart guard).
+
+        ts is signature-covered (part of the signed envelope), so an
+        attacker cannot bump a captured request's ts past the floor.
+        Anything older than this boot is denied even though the nonce
+        table is fresh — that is the whole point.
+        """
+        try:
+            ts_f = float(ts)
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            return ts_f >= self._boot_ts
 
     def nonce_seen(self, nonce):
         """Membership test for the v2 replay check (read-only)."""
@@ -175,6 +215,57 @@ STATE = VerifierState()
 EMITTER = None  # set in main()
 
 
+def _acquire_instance_lock(state_dir):
+    """M-1: single-instance enforcement. Returns the held lock fd.
+
+    Raises SystemExit(2) when another verifier instance holds the lock:
+    two writers would silently diverge the nonce/rate/spend tables, so
+    the second instance must fail fast instead of starting. The
+    violation is detectable: non-zero exit + this exact stderr line.
+    """
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    path = os.path.join(state_dir, _LOCK_FILE)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        print(f"error: another verifier instance holds {path}; "
+              f"the verifier enforces single-instance "
+              f"(docs/deployment-constraints.md)", file=sys.stderr)
+        raise SystemExit(2)
+    return fd
+
+
+def _init_boot_state(state_dir, now=None):
+    """M-1: durable boot floor. Returns (instance_id, boot_ts).
+
+    Writes the boot record BEFORE serving. boot_ts is monotonic across
+    restarts (max of the wall clock and the previous floor), so a
+    backward clock step can never reopen a replay window. Requests
+    with ts < boot_ts are denied (VerifierState.allows_timestamp) —
+    clients retry with a fresh ts+nonce.
+    """
+    now = time.time() if now is None else now
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    path = os.path.join(state_dir, _BOOT_FILE)
+    prev = 0.0
+    try:
+        with open(path, encoding="utf-8") as f:
+            prev = float(json.load(f).get("boot_ts", 0.0))
+    except (OSError, ValueError):
+        prev = 0.0
+    boot_ts = max(now, prev)
+    instance_id = uuid.uuid4().hex[:16]
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"boot_ts": boot_ts, "instance_id": instance_id,
+                   "started_at": now}, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+    STATE.set_boot_ts(boot_ts)
+    return instance_id, boot_ts
+
+
 def decide(req):
     """Core decision logic (pure apart from STATE). Returns
     (decision, reason, lane, cred_or_None, evidence_or_None).
@@ -187,6 +278,14 @@ def decide(req):
     cred = req.get("credential") or {}
     action = req.get("action") or {}
     atype = action.get("type", "")
+
+    # M-1: durable boot floor, before anything else. A restart wipes
+    # the nonce table; without this, a request captured before the
+    # restart could replay inside its timestamp window. ts is
+    # signature-covered, so it cannot be bumped past the floor.
+    if not STATE.allows_timestamp(req.get("ts"), now):
+        return ("deny", "replay: request predates verifier boot",
+                "unverified", cred if isinstance(cred, dict) else None, None)
 
     if MANIFEST_PATH:
         return _decide_v2(req, now, tenant_id, cred, action, atype)
@@ -417,6 +516,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     global EMITTER
+    # M-1: fail fast on a second instance; then establish the durable
+    # boot floor before serving a single request.
+    _INSTANCE_LOCK_FD = _acquire_instance_lock(STATE_DIR)  # noqa: F841
+    instance_id, boot_ts = _init_boot_state(STATE_DIR)
+    print(f"verifier boot instance_id={instance_id} boot_ts={boot_ts} "
+          f"state_dir={STATE_DIR}", flush=True)
     registry = TenantRegistry(TENANTS_PATH)
     log = ReceiptLog(RECEIPTS_PATH, registry)
     EMITTER = ReceiptEmitter(registry, log)
