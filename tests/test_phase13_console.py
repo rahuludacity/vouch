@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -250,19 +251,34 @@ class TestEnrollTier1(ConsoleBase):
         return {"keys": [{"kty": "OKP", "crv": "Ed25519",
                           "x": _b64url_nopad(bytes.fromhex(pub))}]}
 
+    def _mint_token(self, domain):
+        """Mint a challenge via the console; return its token from stdout."""
+        rc, out, err = _run(["dns-challenge", "--domain", domain],
+                            self.store)
+        self.assertEqual(rc, 0, err)
+        m = re.search(r"--challenge-token ([0-9a-f]{64})", out)
+        self.assertIsNotNone(m, out)
+        return m.group(1)
+
     def test_enroll_tier1_needs_txt_first_then_succeeds(self):
         domain = "example.com"
-        token = "tok-" + "ab" * 16
-        # First attempt: no token published -> exit 2, "publish TXT then re-run".
+        # Unknown token (never minted by dns-challenge) fails closed.
+        rc, out, err = _run(
+            ["enroll-tier1", "--principal", "site", "--domain", domain,
+             "--pubkey", T3_PUB, "--label", "web",
+             "--challenge-token", "tok-" + "ab" * 16], self.store)
+        self.assertEqual(rc, 2)
+        self.assertIn("unknown challenge token", err)
+        # dns-challenge mints the record the operator must publish.
+        token = self._mint_token(domain)
+        # First attempt: minted but no token published -> exit 2,
+        # "publish TXT then re-run".
         rc, out, err = _run(
             ["enroll-tier1", "--principal", "site", "--domain", domain,
              "--pubkey", T3_PUB, "--label", "web",
              "--challenge-token", token], self.store)
         self.assertEqual(rc, 2)
         self.assertIn("publish TXT then re-run", err)
-        # dns-challenge mints the record the operator must publish.
-        rc, out, err = _run(["dns-challenge", "--domain", domain], self.store)
-        self.assertEqual(rc, 0, err)
         # Publish the token (stubbed DNS) and serve the JWKS (stubbed HTTPS).
         self.records["_vouch-challenge." + domain] = [token]
         self.jwks["https://" + domain + "/.well-known/vouch-keys"] = \
@@ -281,7 +297,7 @@ class TestEnrollTier1(ConsoleBase):
 
     def test_enroll_tier1_rejects_key_missing_from_jwks(self):
         domain = "example.org"
-        token = "tok-" + "cd" * 16
+        token = self._mint_token(domain)
         self.records["_vouch-challenge." + domain] = [token]
         self.jwks["https://" + domain + "/.well-known/vouch-keys"] = \
             self._jwks_for(T2_PUB)  # wrong key
@@ -292,14 +308,12 @@ class TestEnrollTier1(ConsoleBase):
         self.assertNotEqual(rc, 0)
         self.assertIn("key directory", err)
 
-    def test_enroll_tier1_without_token_prints_txt_and_exits_2(self):
+    def test_enroll_tier1_without_token_points_to_dns_challenge(self):
         rc, out, err = _run(
             ["enroll-tier1", "--principal", "site", "--domain", "example.net",
              "--pubkey", T3_PUB, "--label", "web"], self.store)
         self.assertEqual(rc, 2)
-        self.assertIn("_vouch-challenge.example.net", out)
-        self.assertIn("publish TXT then re-run", err)
-
+        self.assertIn("dns-challenge", err)
 
 class TestServeManifest(ConsoleBase):
     def test_serve_refuses_without_manifest(self):

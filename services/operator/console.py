@@ -28,6 +28,7 @@ import time
 from ..verifier import ed25519
 from ..verifier import enrollment
 from ..verifier.enrollment import (
+    CHALLENGE_TTL_S,
     TransparencyLog,
     build_manifest,
     create_dns_challenge,
@@ -75,6 +76,9 @@ def _store_paths(store):
         "pub": os.path.join(store, _PUB_FILE),
         "log": os.path.join(store, _LOG_FILE),
         "manifest": os.path.join(store, _MANIFEST_FILE),
+        "challenges": os.path.join(store, "challenges"),
+        "consumed_challenges": os.path.join(
+            store, "consumed_challenges.json"),
     }
 
 
@@ -201,35 +205,92 @@ def cmd_dns_challenge(args):
         ch = create_dns_challenge(args.domain)
     except ValueError as exc:
         return _fail(str(exc))
+    paths = _store_paths(args.store)
+    _ensure_store(paths)
+    _challenge_store_save(paths, ch)
     print(f"publish this TXT record, then re-run enroll-tier1 with "
-          f"--challenge-token:\n  {ch['txt_name']} IN TXT \"{ch['token']}\"")
+          f"--challenge-token {ch['token']}:\n"
+          f"  {ch['txt_name']} IN TXT \"{ch['token']}\"")
+    print(f"challenge id {ch['challenge_id']}: expires in "
+          f"{CHALLENGE_TTL_S}s and is single-use")
     return 0
 
 
-def _challenge_from_args(args):
-    domain = args.domain.strip().lower()
-    txt_name = args.txt_name or ("_vouch-challenge." + domain)
-    return {"domain": domain, "token": args.challenge_token,
-            "txt_name": txt_name, "created_at": round(time.time(), 3)}
+def _challenge_store_save(paths, challenge):
+    """Persist a minted challenge (0600) so enroll-tier1 can find it.
+
+    M-3: challenges must be minted by this operator (persisted with
+    their real created_at and challenge_id) — enroll-tier1 never
+    reconstructs one on the fly, which would reset the expiry clock.
+    """
+    os.makedirs(paths["challenges"], mode=0o700, exist_ok=True)
+    path = os.path.join(paths["challenges"],
+                        challenge["challenge_id"] + ".json")
+    _write_file_0600(path, json.dumps(challenge, indent=2, sort_keys=True))
+
+
+def _challenge_store_load(paths, token):
+    """Return the stored challenge for a token (latest created_at wins)."""
+    best = None
+    d = paths["challenges"]
+    if os.path.isdir(d):
+        for name in os.listdir(d):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(d, name), encoding="utf-8") as f:
+                    ch = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if isinstance(ch, dict) and ch.get("token") == token:
+                if (best is None
+                        or ch.get("created_at", 0)
+                        > best.get("created_at", 0)):
+                    best = ch
+    return best
+
+
+def _consumed_challenges_load(paths):
+    """The store-backed single-use registry (set of challenge ids)."""
+    try:
+        with open(paths["consumed_challenges"], encoding="utf-8") as f:
+            ids = json.load(f)
+    except (OSError, ValueError):
+        return set()
+    return {i for i in ids if isinstance(i, str) and i}
+
+
+def _consumed_challenges_save(paths, consumed):
+    _write_file_0600(paths["consumed_challenges"],
+                     json.dumps(sorted(consumed), indent=2))
 
 
 def cmd_enroll_tier1(args):
+    paths = _store_paths(args.store)
+    _ensure_store(paths)
     if not args.challenge_token:
-        try:
-            ch = create_dns_challenge(args.domain)
-        except ValueError as exc:
-            return _fail(str(exc))
-        print(f"publish this TXT record, then re-run with --challenge-token "
-              f"{ch['token']}:\n  {ch['txt_name']} IN TXT \"{ch['token']}\"")
+        print("mint a challenge first with the dns-challenge command, "
+              "publish its TXT record, then re-run with --challenge-token",
+              file=sys.stderr)
         print("error: publish TXT then re-run", file=sys.stderr)
         return EXIT_NEEDS_TXT
-    challenge = _challenge_from_args(args)
-    ok, reason = verify_dns_challenge(challenge, fetch_txt)
+    # M-3: the challenge must be one this operator minted (stored with
+    # its real created_at/challenge_id). Unknown tokens fail closed —
+    # there is no path that rebuilds a challenge with created_at=now.
+    challenge = _challenge_store_load(paths, args.challenge_token)
+    if challenge is None:
+        print("error: unknown challenge token — mint one with the "
+              "dns-challenge command", file=sys.stderr)
+        return EXIT_NEEDS_TXT
+    if args.txt_name and args.txt_name != challenge.get("txt_name"):
+        return _fail("--txt-name does not match the minted challenge")
+    consumed = _consumed_challenges_load(paths)
+    ok, reason = verify_dns_challenge(challenge, fetch_txt,
+                                      consumed=consumed)
     if not ok:
         print(f"error: {reason}", file=sys.stderr)
         print("error: publish TXT then re-run", file=sys.stderr)
         return EXIT_NEEDS_TXT
-    paths = _store_paths(args.store)
     try:
         priv_hex, pub_hex = _load_operator(paths)
     except ValueError as exc:
@@ -240,9 +301,13 @@ def cmd_enroll_tier1(args):
             log=log, principal_id=args.principal, domain=args.domain,
             pubkey_hex=args.pubkey, label=args.label, challenge=challenge,
             fetch_txt=fetch_txt, fetch_https=fetch_https,
-            operator_priv_hex=priv_hex, operator_pub_hex=pub_hex)
+            operator_priv_hex=priv_hex, operator_pub_hex=pub_hex,
+            consumed_challenges=consumed)
     except ValueError as exc:
         return _fail(str(exc))
+    # enroll_principal_tier1 consumed the challenge into the set; the
+    # set is the cross-process single-use registry, so persist it.
+    _consumed_challenges_save(paths, consumed)
     print(f"enrolled {cert['principal_id']} tier domain-control "
           f"domain {cert['domain']} "
           f"key_id {cert['key_ids'][0]['key_id']} "
@@ -520,21 +585,24 @@ def build_parser():
     a.set_defaults(func=cmd_new_principal)
 
     a = sub.add_parser("dns-challenge",
-                       help="mint a DNS challenge for a domain")
+                       help="mint a DNS challenge for a domain "
+                            "(persisted; expires in 15m, single-use)")
     a.add_argument("--domain", required=True)
     a.set_defaults(func=cmd_dns_challenge)
 
     a = sub.add_parser("enroll-tier1",
                        help="enroll a principal at tier 1 (domain-control). "
-                            "Without --challenge-token it prints the TXT "
-                            "record to publish and exits 2.")
+                            "Requires --challenge-token from a challenge "
+                            "minted by dns-challenge (15m expiry, "
+                            "single-use); exits 2 when not ready.")
     a.add_argument("--principal", required=True)
     a.add_argument("--domain", required=True)
     a.add_argument("--pubkey", required=True,
                    help="principal's Ed25519 public key (64 hex chars)")
     a.add_argument("--label", required=True)
     a.add_argument("--challenge-token", default=None,
-                   help="256-bit hex token from the published TXT record")
+                   help="token from a challenge minted by dns-challenge "
+                        "(single-use, expires 15m after minting)")
     a.add_argument("--txt-name", default=None,
                    help="override the TXT owner name "
                         "(default _vouch-challenge.<domain>)")
