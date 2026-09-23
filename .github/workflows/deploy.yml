@@ -1,0 +1,93 @@
+name: Deploy to AWS
+
+# Push to main = deploy. No stored credentials: GitHub proves its identity
+# to AWS via OIDC and assumes arn:aws:iam::467392264044:role/vouch-github-deploys,
+# which can only run SSM commands on the single Vouch instance.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: vouch-prod-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  INSTANCE_ID: i-0044239302886d81f
+  ROLE_ARN: arn:aws:iam::467392264044:role/vouch-github-deploys
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume deploy role (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy on the box via SSM
+        id: deploy
+        run: |
+          cat > /tmp/deploy.sh <<'SCRIPT'
+          set -e
+          echo "=== pre-deploy ==="
+          cd /opt/vouch
+          echo "before: $(git rev-parse HEAD)"
+          git fetch origin main
+          git checkout -q main
+          git pull --ff-only origin main
+          echo "after:  $(git rev-parse HEAD)"
+          echo "=== deploy ==="
+          bash /opt/vouch/deploy.sh
+          echo "=== containers ==="
+          (docker compose ps 2>/dev/null || docker ps) | head -20
+          echo "=== port check ==="
+          (ss -tlnp 2>/dev/null | grep -E ':(9005|9011) ' || echo "ports 9005/9011 free")
+          echo "=== demo endpoint ==="
+          curl -sk -o /dev/null -w "GET /demo -> %{http_code}\n" https://localhost/demo
+          SCRIPT
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --parameters "commands=$(cat /tmp/deploy.sh | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().splitlines()))')" \
+            --timeout-seconds 1200 \
+            --query 'Command.CommandId' --output text)
+          echo "command_id=$CMD_ID"
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+          for i in $(seq 1 40); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" \
+              --instance-id "$INSTANCE_ID" --query 'Status' --output text 2>/dev/null || echo Pending)
+            echo "[$i] $STATUS"
+            case "$STATUS" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 30
+          done
+          aws ssm get-command-invocation --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query '[Status, StandardOutputContent, StandardErrorContent]' \
+            --output text | head -100
+          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" --query 'Status' --output text)
+          [ "$STATUS" = "Success" ] || { echo "DEPLOY FAILED: $STATUS"; exit 1; }
+
+      - name: Verify live site
+        run: |
+          for i in 1 2 3 4 5 6; do
+            CODE=$(curl -sk -o /dev/null -w "%{http_code}" https://52-5-85-214.sslip.io/demo || echo 000)
+            echo "try $i: /demo -> $CODE"
+            [ "$CODE" = "200" ] && break
+            sleep 20
+          done
+          [ "$CODE" = "200" ] || { echo "demo page not live"; exit 1; }
+          curl -sk -o /dev/null -w "dashboard -> %{http_code}\n" https://52-5-85-214.sslip.io/
+          echo "DEPLOY GREEN"
