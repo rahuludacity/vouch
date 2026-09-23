@@ -18,6 +18,8 @@ import threading
 import time
 
 from gatekeeper import policy_v2
+from gatekeeper.controlplane import (  # noqa: E402 — TTL lives at the
+    DEPLOYMENT_TOKEN_TTL_S, parse_deployment_token)  # enforcement point
 
 PLANS = ("free", "pro", "team")
 STATUSES = ("active", "suspended")
@@ -522,6 +524,9 @@ class ControlPlaneDB:
 
         The plaintext is stored like tenant key material (DB is chmod 0600)
         so the runner can fetch it for container injection at any time.
+        Tokens carry their issued epoch and expire DEPLOYMENT_TOKEN_TTL_S
+        later (enforced by the gatekeeper); see get_deployment_token for
+        the transparent refresh-on-read.
         """
         token = self._build_deployment_token(
             deployment_id, tenant_id, self._deployment_signing_key())
@@ -542,14 +547,26 @@ class ControlPlaneDB:
 
         Runner-scoped internal endpoint only — this is a bearer credential,
         not key material, but it is never exposed to tenants.
+
+        M-2: tokens expire DEPLOYMENT_TOKEN_TTL_S after issuance. A read
+        of an expired (but not revoked) token transparently re-mints it
+        so running deployments keep working across the TTL boundary.
+        Revoked tokens are never resurrected: revoked_at IS NOT NULL
+        still returns None.
         """
         row = self._one(
-            "SELECT token, revoked_at FROM deployment_tokens WHERE"
-            " deployment_id = ?",
+            "SELECT token, tenant_id, revoked_at FROM deployment_tokens"
+            " WHERE deployment_id = ?",
             (deployment_id,),
         )
         if not row or row["revoked_at"] is not None:
             return None
+        parsed = parse_deployment_token(row["token"])
+        if parsed is not None:
+            _dep_id, _tenant_id, issued, _sig = parsed
+            if _utcnow() - issued > DEPLOYMENT_TOKEN_TTL_S:
+                return self.mint_deployment_token(deployment_id,
+                                                  row["tenant_id"])
         return row["token"]
 
     def revoke_deployment_token(self, deployment_id):
