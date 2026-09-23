@@ -140,7 +140,7 @@ def _open_log(paths):
 
 def _principal_exists(log, principal_id):
     try:
-        principals, _ = enrollment._fold_log_into_principals(log.entries())
+        principals, _, _ = enrollment._fold_log_into_principals(log.entries())
     except ValueError:
         return False
     return principal_id in principals
@@ -322,6 +322,46 @@ def cmd_revoke_credential(args):
     except ValueError as exc:
         return _fail(str(exc))
     print(f"revoked credential {handle} for {args.principal}")
+    return 0
+
+
+def cmd_revoke_delegation_link(args):
+    """Surgically revoke one delegation grant by its link handle.
+
+    Appends a "revoke-delegation-link" event to the transparency log;
+    the next `manifest` rebuild folds the handle into
+    revoked_delegation_handles, and verifiers deny any chain containing
+    the link (fail-closed). The credential's other links — and the
+    credential itself — keep working.
+    """
+    denied = _require_yes(args, "to revoke a delegation link")
+    if denied is not None:
+        return denied
+    handle = args.revocation_handle
+    if (not isinstance(handle, str) or not handle
+            or len(handle) > 256
+            or any(ord(c) < 0x20 or ord(c) == 0x7F for c in handle)):
+        return _fail("revocation handle must be a non-empty printable string")
+    if not isinstance(args.reason, str) or not args.reason.strip():
+        return _fail("reason must be a non-empty string")
+    paths = _store_paths(args.store)
+    try:
+        priv_hex, _pub_hex = _load_operator(paths)
+    except ValueError as exc:
+        return _fail(str(exc))
+    log = _open_log(paths)
+    if not _principal_exists(log, args.principal):
+        return _fail(f"unknown principal {args.principal!r}")
+    now = round(time.time(), 3)
+    payload = {"principal_id": args.principal,
+               "revocation_handle": handle,
+               "revoked_at": now,
+               "reason": args.reason.strip()}
+    try:
+        log.append("revoke-delegation-link", payload, priv_hex, ts=now)
+    except ValueError as exc:
+        return _fail(str(exc))
+    print(f"revoked delegation link {handle} for {args.principal}")
     return 0
 
 
@@ -525,6 +565,20 @@ def build_parser():
     a.add_argument("--yes", action="store_true",
                    help="confirm this destructive operation")
     a.set_defaults(func=cmd_revoke_credential)
+
+    a = sub.add_parser("revoke-delegation-link",
+                       help="revoke one delegation link by its revocation "
+                            "handle (surgical: the credential's other "
+                            "links keep working)")
+    a.add_argument("--principal", required=True,
+                   help="principal at the root of the delegation chain "
+                        "(audit context)")
+    a.add_argument("--revocation-handle", required=True,
+                   help="the link's revocation handle (rh-...)")
+    a.add_argument("--reason", required=True)
+    a.add_argument("--yes", action="store_true",
+                   help="confirm this destructive operation")
+    a.set_defaults(func=cmd_revoke_delegation_link)
 
     a = sub.add_parser("suspend", help="suspend a principal")
     a.add_argument("--principal", required=True)

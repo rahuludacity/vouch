@@ -55,7 +55,8 @@ ROTATION_OVERLAP_S = 72 * 3600
 # understands every type so statuses stay consistent across phases.
 LOG_EVENT_TYPES = frozenset({
     "enroll", "rotate", "suspend", "unsuspend",
-    "revoke-key", "revoke-credential", "operator-key",
+    "revoke-key", "revoke-credential", "revoke-delegation-link",
+    "operator-key",
 })
 
 # Size caps: the log is untrusted input on read (it may be synced from
@@ -535,10 +536,13 @@ def _fold_log_into_principals(entries):
       unsuspend:         {"principal_id","unsuspended_at"}
       revoke-key:        {"principal_id","key_id","revoked_at","reason"}
       revoke-credential: {"revocation_handle"}
+      revoke-delegation-link: {"principal_id" (audit context),
+                               "revocation_handle"}
       operator-key:      {"pubkey","action"}  # recorded, not folded here
     """
     principals = {}
     revoked_credentials = []
+    revoked_delegation_links = []
     for e in entries:
         p = e["payload"]
         t = e["type"]
@@ -590,11 +594,20 @@ def _fold_log_into_principals(entries):
             handle = p.get("revocation_handle")
             if handle and handle not in revoked_credentials:
                 revoked_credentials.append(handle)
+        elif t == "revoke-delegation-link":
+            # Surgical revocation of one delegation grant. The handle is
+            # minted into the link at issuance (issue_delegation) and
+            # signed; verification denies any chain containing it
+            # (credentials._verify_chain, fail-closed). principal_id is
+            # audit context only — the handle alone identifies the grant.
+            handle = p.get("revocation_handle")
+            if handle and handle not in revoked_delegation_links:
+                revoked_delegation_links.append(handle)
         elif t == "operator-key":
             continue  # operator set changes are recorded, not folded here
         else:
             raise ValueError(f"cannot fold unknown event type {t!r}")
-    return principals, revoked_credentials
+    return principals, revoked_credentials, revoked_delegation_links
 
 
 def build_manifest(*, log, operator_priv_hex, operator_pubkey,
@@ -618,7 +631,7 @@ def build_manifest(*, log, operator_priv_hex, operator_pubkey,
     if not ok:
         raise ValueError(f"refusing to build manifest from a broken log: "
                          f"{reasons[0] if reasons else 'unknown'}")
-    principals, revoked = _fold_log_into_principals(log.entries())
+    principals, revoked, revoked_links = _fold_log_into_principals(log.entries())
     now = _ts(issued_at)
     manifest = {
         "version": _next_manifest_version(log, op_pub),
@@ -628,6 +641,7 @@ def build_manifest(*, log, operator_priv_hex, operator_pubkey,
         "operator_pubkey": op_pub,
         "principals": [principals[pid] for pid in sorted(principals)],
         "revoked_credentials": sorted(revoked),
+        "revoked_delegation_handles": sorted(revoked_links),
         "signature": "",
     }
     manifest["signature"] = ed25519.sign_hex(
@@ -649,7 +663,7 @@ def verify_manifest(manifest, operator_pubkeys, now=None):
             return False, ["manifest is not an object"]
         for f in ("version", "issued_at", "not_before", "valid_until",
                   "operator_pubkey", "principals", "revoked_credentials",
-                  "signature"):
+                  "revoked_delegation_handles", "signature"):
             if f not in manifest:
                 reasons.append(f"manifest missing field '{f}'")
         if reasons:
@@ -678,6 +692,8 @@ def verify_manifest(manifest, operator_pubkeys, now=None):
                     for w in _check_principal_entry(pe))
         if not isinstance(manifest["revoked_credentials"], list):
             reasons.append("manifest revoked_credentials must be a list")
+        if not isinstance(manifest["revoked_delegation_handles"], list):
+            reasons.append("manifest revoked_delegation_handles must be a list")
         try:
             _check_hex32(manifest["operator_pubkey"], "operator_pubkey")
         except ValueError:
@@ -1082,7 +1098,7 @@ def _require_pubkey_in_jwks(jwks, pubkey_hex):
 
 def _current_principals(log):
     """Fold the log to today's principal state (raises ValueError if bad)."""
-    principals, _ = _fold_log_into_principals(log.entries())
+    principals, _, _ = _fold_log_into_principals(log.entries())
     return principals
 
 
