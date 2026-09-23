@@ -40,6 +40,18 @@ DEP_BIND_TTL = 300.0
 # sig = HMAC-SHA256(platform deployment key,
 #                   "<deployment_id>.<tenant_id>.<issued>")[:32 hex].
 DEP_TOKEN_PREFIX = "vouch_dep_"
+# M-2: deployment tokens expire. Lifetime is 7 days: long enough to
+# outlive typical deployments without churn, short enough to bound the
+# exposure of a leaked token. The live revocation path is the binding
+# check below (deployment must be pending/running, revalidated every
+# DEP_BIND_TTL); expiry is the backstop. The control plane's
+# get_deployment_token() transparently re-mints expired tokens on read
+# (revoked ones are never resurrected), so running deployments keep
+# working across the boundary.
+DEPLOYMENT_TOKEN_TTL_S = 7 * 24 * 3600
+# Tolerance for a token whose issued time is slightly in the future
+# (clock skew between minter and verifier). Beyond this: fail closed.
+_DEP_TOKEN_FUTURE_SKEW_S = 300
 _DEP_TOKEN_RE = re.compile(
     r"^vouch_dep_(dep_[0-9a-f]{16})_(.+)_(\d+)_([0-9a-f]{32})$")
 
@@ -339,12 +351,23 @@ class DeploymentTokenVerifier:
             self._bindings.pop(dep_id, None)
 
     # --------------------------------------------------------------- verify
-    def verify(self, token):
-        """-> authoritative tenant_id, or None when the credential is bad."""
+    def verify(self, token, *, max_age_s=DEPLOYMENT_TOKEN_TTL_S, now=None):
+        """-> authoritative tenant_id, or None when the credential is bad.
+
+        M-2: tokens expire max_age_s after issuance (default
+        DEPLOYMENT_TOKEN_TTL_S = 7 days). An issued timestamp in the
+        future beyond skew, or older than max_age_s, fails closed —
+        even with a valid HMAC.
+        """
         parsed = parse_deployment_token(token)
         if parsed is None:
             return None
         dep_id, tenant_id, issued, sig = parsed
+        now = time.time() if now is None else now
+        if issued > now + _DEP_TOKEN_FUTURE_SKEW_S:
+            return None  # fail closed: issued in the future
+        if now - issued > max_age_s:
+            return None  # fail closed: token expired
         key = self._signing_key()
         if key is None:
             return None  # fail closed: no key authority, no trust

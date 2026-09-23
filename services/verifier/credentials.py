@@ -252,15 +252,24 @@ def verify_delegation_link(link, now):
     return not reasons, reasons
 
 
-def _verify_chain(cred, now):
+def _verify_chain(cred, now, revoked_link_handles=None):
     """Delegation-chain continuity + scope narrowing. Returns (ok, reasons).
 
     Assumes the credential's own signature and expiry were already checked.
     Shared by verify_credential (v1) and verify_action_request_v2.
     Never raises on malformed input: every structural problem becomes a
     deny reason (fail-closed).
+
+    revoked_link_handles: set-like of revoked per-link revocation
+    handles (from the manifest's revoked_delegation_handles). Any chain
+    containing a revoked handle is denied, even if every signature is
+    valid — this is the surgical revocation of one delegation grant
+    without killing the whole credential. A link with no handle cannot
+    be revoked this way (nothing to match); it is treated as not
+    revoked. None disables the check (the v1 path has no manifest).
     """
     reasons = []
+    revoked = set(revoked_link_handles or ())
     links = cred.get("delegations") if isinstance(cred, dict) else None
     _check(isinstance(links, list) and len(links) >= 1, reasons,
            "delegation chain empty: principal must delegate to the agent")
@@ -278,10 +287,19 @@ def _verify_chain(cred, now):
         if not ok:
             reasons.extend(f"link {i}: {w}" for w in why)
             continue
+        rh = link.get("revocation_handle")
+        if rh and rh in revoked:
+            reasons.append(f"link {i}: delegation link revoked")
         if i > 0:
             _check(link.get("delegator_pubkey") ==
                    links[i - 1].get("delegatee_pubkey"), reasons,
                    f"link {i}: chain continuity broken")
+            # The narrowing diagnostic describes the signed chain: it is
+            # evaluated against the previous structurally-valid link's
+            # scope even when a link was revoked (revocation is its own
+            # independent deny). Skipping the assignment here used to make
+            # revoking link 0 emit a false "link 1: scope widens" because
+            # link 1 was compared against None.
             ok_n, why_n = scope_narrows(link.get("scope"), prev_scope)
             _check(ok_n, reasons, f"link {i}: scope widens ({why_n})")
         prev_scope = link.get("scope")
@@ -292,8 +310,14 @@ def _verify_chain(cred, now):
     return not reasons, reasons
 
 
-def verify_credential(cred, trusted_issuers, now=None):
-    """Full credential check. Returns (ok, reasons list)."""
+def verify_credential(cred, trusted_issuers, now=None,
+                      revoked_link_handles=None):
+    """Full credential check. Returns (ok, reasons list).
+
+    revoked_link_handles: optional set-like of revoked per-link
+    revocation handles; any chain containing one is denied (surgical
+    link revocation). None disables the check.
+    """
     now = _ts(now)
     reasons = []
     for f in ("credential_id", "principal", "agent_id", "agent_pubkey",
@@ -314,7 +338,7 @@ def verify_credential(cred, trusted_issuers, now=None):
     if reasons:
         return False, reasons  # no point walking a forged credential
 
-    ok_c, why_c = _verify_chain(cred, now)
+    ok_c, why_c = _verify_chain(cred, now, revoked_link_handles)
     reasons.extend(why_c)
     return not reasons, reasons
 
@@ -544,8 +568,9 @@ def verify_action_request_v2(req, *, manifest, operator_pubkeys,
             cred["issued_at"] <= now < cred["expires_at"]):
         return False, ["credential expired or not yet valid"], {}
 
-    # -- 4. delegation chain -------------------------------------------
-    ok_c, why_c = _verify_chain(cred, now)
+    # -- 4. delegation chain (per-link revocation enforced) --------------
+    ok_c, why_c = _verify_chain(
+        cred, now, manifest.get("revoked_delegation_handles") or ())
     if not ok_c:
         return False, why_c, {}
 

@@ -3,13 +3,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac, createHash } from "node:crypto";
-import { verifyChain } from "../src/verify.js";
+import { verifyChain, canonicalJson } from "../src/verify.js";
 
-function canon(v) {
-  if (v === null || typeof v !== "object") return JSON.stringify(v);
-  if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
-  return "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}";
-}
+// Mint with the exact verification encoding (canonicalJson is byte-
+// identical to Python's json.dumps(sort_keys=True)), so these fixtures
+// exercise the same code path as real Python-minted receipts.
+const canon = canonicalJson;
 
 function mint(seq, prevHash, tenantId, kid, key, taskId, agentId, tool, args, decision, ts = 1700000000.0) {
   const body = {

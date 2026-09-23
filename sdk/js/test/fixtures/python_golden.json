@@ -1,0 +1,60 @@
+{
+  "keys": {
+    "golden-k1": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c"
+  },
+  "kid": "golden-k1",
+  "receipts": [
+    {
+      "agent_id": "agent-α",
+      "args_sha256": "285d946ef3d9103d7d4502e4ec31ab2242b49053aef18f11214c083dea65b7a8",
+      "decision": "allow",
+      "hash": "d2c8185e83e8dd34e5be439029314faa9ca95d4d57376b975f29eb112de50970",
+      "kid": "golden-k1",
+      "policy_version": 7,
+      "prev_hash": "GENESIS",
+      "reason": "décision ✓ — café ☕\nnewline\ttab",
+      "rule_id": "web.fetch.v2",
+      "seq": 1,
+      "sig": "b895706f60f2e5aaa21660973600df9d127b532683008576ef711be6d852a3ec",
+      "task_id": "task-1",
+      "tenant_id": "acme-golden",
+      "tool": "web.fetch",
+      "ts": 1789286880.123
+    },
+    {
+      "agent_id": "agent-α",
+      "args_sha256": "7eebedbb3745c3dbe920c142c1e49df865ad6a567f9ead28272a8090c4aee5ae",
+      "decision": "deny",
+      "hash": "b7a4225a810dd979bfcec257ac7813204038937552ee70031057beec6c52f923",
+      "kid": "golden-k1",
+      "policy_version": null,
+      "prev_hash": "d2c8185e83e8dd34e5be439029314faa9ca95d4d57376b975f29eb112de50970",
+      "reason": "over the €50 limit \"quoted\" \\ backslash",
+      "rule_id": null,
+      "seq": 2,
+      "sig": "078b9e2c9f88c6f6d3aaf0848c11a99a1b561dbbcb5920970c2ef811c9d1a8fe",
+      "task_id": "task-2",
+      "tenant_id": "acme-golden",
+      "tool": "payments.initiate",
+      "ts": 1789286880.456
+    },
+    {
+      "agent_id": "agent-β",
+      "args_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      "decision": "allow",
+      "hash": "3410d8f75ecba5b2973b30e2a6ba93028be6f180c3d91f9a22e2dd8a91db44af",
+      "kid": "golden-k1",
+      "policy_version": 1,
+      "prev_hash": "b7a4225a810dd979bfcec257ac7813204038937552ee70031057beec6c52f923",
+      "reason": null,
+      "rule_id": "form.submit",
+      "seq": 3,
+      "sig": "e191f7712f0dced7a4d12424cb0866e8e23ce82f12f0d3d802b3a62f13243532",
+      "task_id": "task-3",
+      "tenant_id": "acme-golden",
+      "tool": "form.submit",
+      "ts": 1789286881.789
+    }
+  ],
+  "tenant_id": "acme-golden"
+}

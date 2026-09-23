@@ -55,7 +55,8 @@ ROTATION_OVERLAP_S = 72 * 3600
 # understands every type so statuses stay consistent across phases.
 LOG_EVENT_TYPES = frozenset({
     "enroll", "rotate", "suspend", "unsuspend",
-    "revoke-key", "revoke-credential", "operator-key",
+    "revoke-key", "revoke-credential", "revoke-delegation-link",
+    "operator-key",
 })
 
 # Size caps: the log is untrusted input on read (it may be synced from
@@ -535,10 +536,13 @@ def _fold_log_into_principals(entries):
       unsuspend:         {"principal_id","unsuspended_at"}
       revoke-key:        {"principal_id","key_id","revoked_at","reason"}
       revoke-credential: {"revocation_handle"}
+      revoke-delegation-link: {"principal_id" (audit context),
+                               "revocation_handle"}
       operator-key:      {"pubkey","action"}  # recorded, not folded here
     """
     principals = {}
     revoked_credentials = []
+    revoked_delegation_links = []
     for e in entries:
         p = e["payload"]
         t = e["type"]
@@ -590,11 +594,20 @@ def _fold_log_into_principals(entries):
             handle = p.get("revocation_handle")
             if handle and handle not in revoked_credentials:
                 revoked_credentials.append(handle)
+        elif t == "revoke-delegation-link":
+            # Surgical revocation of one delegation grant. The handle is
+            # minted into the link at issuance (issue_delegation) and
+            # signed; verification denies any chain containing it
+            # (credentials._verify_chain, fail-closed). principal_id is
+            # audit context only — the handle alone identifies the grant.
+            handle = p.get("revocation_handle")
+            if handle and handle not in revoked_delegation_links:
+                revoked_delegation_links.append(handle)
         elif t == "operator-key":
             continue  # operator set changes are recorded, not folded here
         else:
             raise ValueError(f"cannot fold unknown event type {t!r}")
-    return principals, revoked_credentials
+    return principals, revoked_credentials, revoked_delegation_links
 
 
 def build_manifest(*, log, operator_priv_hex, operator_pubkey,
@@ -618,7 +631,7 @@ def build_manifest(*, log, operator_priv_hex, operator_pubkey,
     if not ok:
         raise ValueError(f"refusing to build manifest from a broken log: "
                          f"{reasons[0] if reasons else 'unknown'}")
-    principals, revoked = _fold_log_into_principals(log.entries())
+    principals, revoked, revoked_links = _fold_log_into_principals(log.entries())
     now = _ts(issued_at)
     manifest = {
         "version": _next_manifest_version(log, op_pub),
@@ -628,6 +641,7 @@ def build_manifest(*, log, operator_priv_hex, operator_pubkey,
         "operator_pubkey": op_pub,
         "principals": [principals[pid] for pid in sorted(principals)],
         "revoked_credentials": sorted(revoked),
+        "revoked_delegation_handles": sorted(revoked_links),
         "signature": "",
     }
     manifest["signature"] = ed25519.sign_hex(
@@ -649,7 +663,7 @@ def verify_manifest(manifest, operator_pubkeys, now=None):
             return False, ["manifest is not an object"]
         for f in ("version", "issued_at", "not_before", "valid_until",
                   "operator_pubkey", "principals", "revoked_credentials",
-                  "signature"):
+                  "revoked_delegation_handles", "signature"):
             if f not in manifest:
                 reasons.append(f"manifest missing field '{f}'")
         if reasons:
@@ -678,6 +692,8 @@ def verify_manifest(manifest, operator_pubkeys, now=None):
                     for w in _check_principal_entry(pe))
         if not isinstance(manifest["revoked_credentials"], list):
             reasons.append("manifest revoked_credentials must be a list")
+        if not isinstance(manifest["revoked_delegation_handles"], list):
+            reasons.append("manifest revoked_delegation_handles must be a list")
         try:
             _check_hex32(manifest["operator_pubkey"], "operator_pubkey")
         except ValueError:
@@ -880,6 +896,16 @@ _CHALLENGE_LABEL = "_vouch-challenge"
 _MAX_JWKS_BYTES = 1 << 20          # 1 MiB cap on fetched key directories
 _MAX_REASON_LEN = 256
 
+# M-3: DNS challenges expire and are single-use. A challenge is a bearer
+# token: anyone who sees the TXT record (or the console output) could
+# replay it to enroll a second principal while the record is still
+# published. The TTL bounds the window; single-use consumption (the
+# challenge_id recorded at the point of enrollment) closes replay
+# entirely. 15 minutes is generous for DNS propagation and tight enough
+# to matter.
+CHALLENGE_TTL_S = 900
+_CHALLENGE_FUTURE_SKEW_S = 300  # created_at beyond this in the future: bogus
+
 # A DNS label: alphanumerics plus interior hyphens, 1-63 chars.
 _DNS_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
@@ -905,19 +931,43 @@ def _check_domain(domain):
 def create_dns_challenge(domain):
     """Mint a DNS-01 style challenge for a domain.
 
-    Returns {"domain","token","txt_name","created_at"} where token is a
-    256-bit value (64 hex chars) from the secrets module and txt_name is
-    "_vouch-challenge." + domain. The principal proves domain control
-    by publishing the token as a TXT record at txt_name.
+    Returns {"challenge_id","domain","token","txt_name","created_at"}
+    where challenge_id ("chc-"+16 hex chars) identifies this challenge
+    for single-use consumption, token is a 256-bit value (64 hex chars)
+    from the secrets module, and txt_name is "_vouch-challenge." +
+    domain. The principal proves domain control by publishing the token
+    as a TXT record at txt_name. Challenges expire CHALLENGE_TTL_S
+    after created_at (enforced by verify_dns_challenge).
     """
     d = _check_domain(domain)
     token = secrets.token_hex(32)
     return {
+        "challenge_id": "chc-" + secrets.token_hex(8),
         "domain": d,
         "token": token,
         "txt_name": _CHALLENGE_LABEL + "." + d,
         "created_at": _ts(),
     }
+
+
+def consume_dns_challenge(consumed, challenge):
+    """Mark a challenge as used (single-use consumption). Idempotent-safe.
+
+    consumed: a mutable set-like owned by the caller (the console keeps
+    a store-backed one). Adds challenge["challenge_id"] to it.
+    Raises ValueError if the challenge is malformed (no id) or was
+    already consumed — callers must treat this as a hard failure, never
+    retry enrollment with the same challenge.
+    """
+    if not isinstance(challenge, dict):
+        raise ValueError("challenge must be a dict")
+    cid = challenge.get("challenge_id")
+    if not isinstance(cid, str) or not cid:
+        raise ValueError("challenge has no challenge_id")
+    if cid in consumed:
+        raise ValueError("challenge already consumed")
+    consumed.add(cid)
+    return cid
 
 
 def _unquote_txt(line):
@@ -930,16 +980,38 @@ def _unquote_txt(line):
     return line.strip()
 
 
-def verify_dns_challenge(challenge, fetch_txt):
+def verify_dns_challenge(challenge, fetch_txt, *, now=None, consumed=None):
     """Check the challenge token against live TXT records.
 
     fetch_txt(txt_name) -> [str] is injectable. Returns (ok, reason);
     never raises — every doubt (bad challenge shape, lookup failure,
     missing token) fails closed.
+
+    M-3: challenges expire and are single-use. The challenge must carry
+    a challenge_id and a numeric created_at; a created_at in the future
+    beyond skew, or older than CHALLENGE_TTL_S, fails closed. When
+    consumed (a set-like of already-consumed challenge ids) is given
+    and this challenge's id is in it, verification fails. This function
+    never mutates — the caller consumes the challenge exactly once,
+    via consume_dns_challenge(), at the point of the state change.
     """
     try:
         if not isinstance(challenge, dict):
             return False, "challenge is not an object"
+        cid = challenge.get("challenge_id")
+        if not (isinstance(cid, str) and cid):
+            return False, "challenge has no challenge_id"
+        created_at = challenge.get("created_at")
+        if (not isinstance(created_at, (int, float))
+                or isinstance(created_at, bool)):
+            return False, "challenge has no valid created_at"
+        now = _ts() if now is None else now
+        if created_at > now + _CHALLENGE_FUTURE_SKEW_S:
+            return False, "challenge created in the future"
+        if now - created_at > CHALLENGE_TTL_S:
+            return False, "challenge expired"
+        if consumed is not None and cid in consumed:
+            return False, "challenge already consumed"
         domain = challenge.get("domain")
         token = challenge.get("token")
         txt_name = challenge.get("txt_name")
@@ -1082,18 +1154,19 @@ def _require_pubkey_in_jwks(jwks, pubkey_hex):
 
 def _current_principals(log):
     """Fold the log to today's principal state (raises ValueError if bad)."""
-    principals, _ = _fold_log_into_principals(log.entries())
+    principals, _, _ = _fold_log_into_principals(log.entries())
     return principals
 
 
 def enroll_principal_tier1(*, log, principal_id, domain, pubkey_hex, label,
                            challenge, fetch_txt, fetch_https,
                            operator_priv_hex, operator_pub_hex,
-                           issued_at=None):
+                           issued_at=None, consumed_challenges=None):
     """Enroll one principal at Tier 1 ("domain-control").
 
     Steps, all fail-closed:
-      1. verify the DNS challenge (raises on failure),
+      1. verify the DNS challenge (raises on failure; M-3: expired,
+         future-dated, or already-consumed challenges are rejected),
       2. fetch https://<domain>/.well-known/vouch-keys (raises on failure),
       3. require the enrolling pubkey to be listed in that JWKS,
       4. append the "enroll" event (tier "domain-control", domain set)
@@ -1101,6 +1174,16 @@ def enroll_principal_tier1(*, log, principal_id, domain, pubkey_hex, label,
 
     fetch_txt(txt_name) -> [str] and fetch_https(url) -> dict are
     injectable; the console passes fetch_txt_via_dig / fetch_https_json.
+
+    consumed_challenges: optional caller-owned mutable set-like. When
+    given, the challenge is verified against it and then consumed
+    exactly once AFTER the "enroll" event is appended — the enrollment
+    is the state change, so a failure before append leaves the
+    challenge reusable (the DNS record is still published), while a
+    replay of a consumed challenge always raises. When None, no
+    single-use enforcement is applied (library callers opting out
+    deliberately; the operator console always passes its store-backed
+    set).
 
     Returns (cert, manifest_entry). Raises ValueError on any failure —
     nothing half-enrolled ever happens.
@@ -1118,7 +1201,8 @@ def enroll_principal_tier1(*, log, principal_id, domain, pubkey_hex, label,
         raise ValueError("challenge must be a dict")
     if challenge.get("domain") != d:
         raise ValueError("challenge was not created for this domain")
-    ok, reason = verify_dns_challenge(challenge, fetch_txt)
+    ok, reason = verify_dns_challenge(challenge, fetch_txt,
+                                      consumed=consumed_challenges)
     if not ok:
         raise ValueError(f"domain control check failed: {reason}")
     if not callable(fetch_https):
@@ -1142,6 +1226,8 @@ def enroll_principal_tier1(*, log, principal_id, domain, pubkey_hex, label,
         "expires_at": round(now + ENROLLMENT_TTL_S, 3),
     }
     entry = log.append("enroll", payload, operator_priv_hex, ts=now)
+    if consumed_challenges is not None:
+        consume_dns_challenge(consumed_challenges, challenge)
     cert = issue_enrollment_certificate(
         principal_id=principal_id,
         tier=TIER_DOMAIN_CONTROL,
