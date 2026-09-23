@@ -343,5 +343,44 @@ class SchemaValidationTest(unittest.TestCase):
         self.assertTrue(rule.matches("x", {"a": "a" * 4096}))
 
 
+class NotificationAllowlistTest(unittest.TestCase):
+    """C-1: the allow_notifications schema — explicit permit, default deny."""
+
+    def test_default_is_deny_all(self):
+        p = Policy.from_dict({"tasks": {}})
+        self.assertEqual(p.allow_notifications, ())
+        self.assertFalse(p.notification_allowed("notifications/initialized"))
+        self.assertFalse(p.notification_allowed("tools/call"))
+
+    def test_listed_method_permitted(self):
+        p = Policy.from_dict({"tasks": {},
+                              "allow_notifications": ["notifications/initialized"]})
+        self.assertTrue(p.notification_allowed("notifications/initialized"))
+        self.assertFalse(p.notification_allowed("ping"))
+
+    def test_non_string_method_never_permitted(self):
+        p = Policy.from_dict({"tasks": {},
+                              "allow_notifications": ["notifications/initialized"]})
+        self.assertFalse(p.notification_allowed(None))
+        self.assertFalse(p.notification_allowed(42))
+        self.assertFalse(p.notification_allowed(["notifications/initialized"]))
+
+    def test_non_list_rejected_at_load(self):
+        with self.assertRaises(PolicyError):
+            Policy.from_dict({"tasks": {},
+                              "allow_notifications": "notifications/initialized"})
+
+    def test_non_string_entry_rejected_at_load(self):
+        with self.assertRaises(PolicyError):
+            Policy.from_dict({"tasks": {},
+                              "allow_notifications": ["ok", 42]})
+
+    def test_shipped_policy_permits_handshake_only(self):
+        # the repo's own policy.yaml must keep working through from_dict
+        p = Policy.from_dict(v1_policy())
+        self.assertTrue(p.notification_allowed("notifications/initialized"))
+        self.assertFalse(p.notification_allowed("notifications/cancelled"))
+
+
 if __name__ == "__main__":
     unittest.main()

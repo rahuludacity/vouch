@@ -16,6 +16,15 @@ never evaluated):
     range     operand {min, max}, numeric, inclusive
     required  arg must be present (operand truthy; falsy = vacuous)
 
+Notification allowlist (C-1 fail-closed, §5.4):
+    allow_notifications: top-level list of JSON-RPC method names that may
+    be forwarded as notifications (no "id"). A notification-shaped
+    `tools/call` NEVER takes this path — it always gets full policy
+    evaluation. Any notification whose method is not on the list is denied
+    (default deny); a non-list, non-string entry is a PolicyError at load.
+    Example: ["notifications/initialized"] keeps the MCP handshake working
+    while everything else fails closed.
+
 Evaluation (policy_v2.decide(task_id, tool, args) -> (bool, reason, rule_id)):
     1. unknown task            -> (False, "unknown task '<id>'", None)
     2. any matching deny rule  -> (False, "denied by rule '<rule_id>'", rule_id)
@@ -469,10 +478,21 @@ class Rule:
 class Policy:
     """Compiled task-scoped policy. decide() is pure and deterministic."""
 
-    def __init__(self, tasks, version=1):
+    def __init__(self, tasks, version=1, allow_notifications=()):
         # tasks: {task_id: {"version": int, "allow": [Rule], "deny": [Rule]}}
+        # allow_notifications: methods permitted as JSON-RPC notifications
+        # (no "id"). Anything not listed is denied (default deny, C-1).
         self.tasks = tasks
         self.version = version
+        self.allow_notifications = tuple(allow_notifications)
+
+    def notification_allowed(self, method):
+        """True iff `method` may be forwarded as a notification.
+
+        `tools/call` never consults this: notification-shaped tools/call
+        always goes through full policy evaluation (fail closed).
+        """
+        return isinstance(method, str) and method in self.allow_notifications
 
     def decide(self, task_id, tool, args):
         """-> (allowed: bool, reason: str|None, rule_id: str|None).
@@ -512,10 +532,17 @@ class Policy:
         if not isinstance(d, dict) or not isinstance(d.get("tasks"), dict):
             raise PolicyError("policy file needs a top-level 'tasks' mapping")
         version = d.get("version", 1)
+        allow_notifications = d.get("allow_notifications", [])
+        if (not isinstance(allow_notifications, list)
+                or not all(isinstance(m, str) for m in allow_notifications)):
+            raise PolicyError(
+                "policy 'allow_notifications' must be a list of method-name "
+                f"strings, got {allow_notifications!r}")
         tasks = {}
         for task_id, entry in d["tasks"].items():
             tasks[task_id] = cls._load_task(task_id, entry or {})
-        return cls(tasks, version=version)
+        return cls(tasks, version=version,
+                   allow_notifications=allow_notifications)
 
     @classmethod
     def _load_task(cls, task_id, entry):

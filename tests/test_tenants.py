@@ -1,10 +1,15 @@
 """Tests for per-tenant signing keys: registry, rotation, and
 tenant-scoped receipt signing/verification (incl. cross-tenant forgery)."""
 import json
+import contextlib
+import io
+import logging
 import os
+import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -194,6 +199,104 @@ class TenantReceiptsTest(unittest.TestCase):
                    args={}, decision="allow")
         ok, failures = ReceiptLog(path, "dev-only-change-me").verify()
         self.assertTrue(ok, failures)
+
+
+class TenantCliKeyHygieneTest(unittest.TestCase):
+    """H-5: tenant create/rotate must never print key material.
+
+    secrets.token_hex is patched to deterministic key material so the
+    test knows the exact hex to hunt for. stdout, stderr, and logging
+    are all captured; the key hex must appear in NONE of them. The
+    key id stays visible, the registry holds the exact key, the
+    registry file is 0600, and no side-channel key files are created.
+    """
+
+    KEY1 = "aa" * 32  # deterministic stand-in for secrets.token_hex(32)
+    KEY2 = "bb" * 32
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vouch-tenants-cli-")
+        self.reg_path = os.path.join(self.tmp, "tenants.json")
+        self._env = mock.patch.dict(
+            os.environ, {"GATEKEEPER_TENANTS_PATH": self.reg_path})
+        self._env.start()
+        # deterministic key material: create -> KEY1, rotate -> KEY2
+        self._token_hex = mock.patch("gatekeeper.tenants.secrets.token_hex",
+                                     side_effect=[self.KEY1, self.KEY2])
+        self._token_hex.start()
+        from gatekeeper import tenants as tenants_mod  # noqa: E402
+        self.tenants_mod = tenants_mod
+        self._log_records = []
+        handler = logging.Handler()
+        handler.emit = self._log_records.append
+        self._log_handler = handler
+        logging.getLogger().addHandler(handler)
+        self.addCleanup(logging.getLogger().removeHandler, handler)
+
+    def tearDown(self):
+        self._token_hex.stop()
+        self._env.stop()
+
+    def _run(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        self._log_records.clear()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.tenants_mod.main(["tenants", *argv])
+        logs = "\n".join(r.getMessage() for r in self._log_records)
+        return rc, out.getvalue(), err.getvalue(), logs
+
+    def _assert_no_key_material(self, *channels):
+        for key_hex in (self.KEY1, self.KEY2):
+            for i, text in enumerate(channels):
+                self.assertNotIn(
+                    key_hex, text,
+                    f"key material leaked into channel {i}: {text!r}")
+
+    def _assert_no_capture_files(self):
+        leftovers = [f for f in os.listdir(self.tmp)
+                     if f.endswith(".key")]
+        self.assertEqual(leftovers, [],
+                         f"side-channel key files created: {leftovers}")
+
+    def test_create_prints_kid_not_key(self):
+        rc, out, err, logs = self._run("create", "acme")
+        self.assertEqual(rc, 0)
+        self._assert_no_key_material(out, err, logs)
+        self._assert_no_capture_files()
+        self.assertIn("k1", out)  # the key id is fine to print
+        self.assertIn("acme", out)
+        # the registry holds the exact deterministic key, owner-only
+        reg = TenantRegistry(self.reg_path)
+        kid, key = reg.signing_key("acme")
+        self.assertEqual((kid, key.hex()), ("k1", self.KEY1))
+        self.assertEqual(stat.S_IMODE(os.stat(self.reg_path).st_mode), 0o600)
+
+    def test_rotate_prints_kid_not_key(self):
+        self._run("create", "acme")
+        rc, out, err, logs = self._run("rotate", "acme")
+        self.assertEqual(rc, 0)
+        self._assert_no_key_material(out, err, logs)
+        self._assert_no_capture_files()
+        self.assertIn("k2", out)
+        self.assertIn("acme", out)
+        reg = TenantRegistry(self.reg_path)
+        kid, key = reg.signing_key("acme")
+        self.assertEqual((kid, key.hex()), ("k2", self.KEY2))
+        # the retired key is still there and still verifiable
+        self.assertEqual(reg.verification_keys("acme")["k1"].hex(), self.KEY1)
+        self.assertEqual(stat.S_IMODE(os.stat(self.reg_path).st_mode), 0o600)
+
+    def test_list_prints_no_key_material(self):
+        self._run("create", "acme")
+        self._run("rotate", "acme")
+        rc, out, err, logs = self._run("list")
+        self.assertEqual(rc, 0)
+        self._assert_no_key_material(out, err, logs)
+        self._assert_no_capture_files()
+
+    def test_registry_file_is_0600(self):
+        self._run("create", "acme")
+        self.assertEqual(stat.S_IMODE(os.stat(self.reg_path).st_mode), 0o600)
 
 
 if __name__ == "__main__":

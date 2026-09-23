@@ -15,6 +15,12 @@ CLI:
     python3 -m gatekeeper.tenants create <tenant-id>
     python3 -m gatekeeper.tenants rotate <tenant-id>
     python3 -m gatekeeper.tenants list
+
+Key hygiene (H-5): key material is NEVER printed to stdout and NEVER
+written anywhere except the 0600 registry file itself. The CLI prints
+only the tenant id and key id; the create()/rotate() return values are
+discarded at the CLI boundary. The registry file is 0600: it holds
+every tenant's signing keys.
 """
 import json
 import os
@@ -47,6 +53,9 @@ class TenantRegistry:
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"tenants": self._tenants}, f, indent=2)
+        # H-5: the registry holds every tenant's signing-key material —
+        # 0600, never group/world-readable, even on a shared box.
+        os.chmod(tmp, 0o600)
         os.replace(tmp, self.path)
 
     def _require(self, tenant_id):
@@ -131,13 +140,13 @@ def main(argv):
         return 2
     cmd, rest = argv[1], argv[2:]
     if cmd == "create" and len(rest) == 1:
-        kid, key = reg.create(rest[0])
-        print(f"tenant '{rest[0]}' created (kid={kid}). Key stored in {reg.path}; keep it secret.")
-        print(f"key_hex={key}")
+        # H-5: the returned key is discarded at the CLI boundary — it
+        # lives only in the 0600 registry file. Print tenant/kid only.
+        kid, _key = reg.create(rest[0])
+        print(f"tenant '{rest[0]}' created (kid={kid}). Key stored in {reg.path} (mode 0600); keep it secret.")
     elif cmd == "rotate" and len(rest) == 1:
-        kid, key = reg.rotate(rest[0])
+        kid, _key = reg.rotate(rest[0])
         print(f"tenant '{rest[0]}' rotated to {kid}. Old receipts still verify.")
-        print(f"new_key_hex={key}")
     elif cmd == "list" and not rest:
         for tid, info in reg.list_tenants().items():
             print(f"{tid}: current={info['current_kid']} keys={info['kids']}")
