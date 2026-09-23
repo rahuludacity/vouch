@@ -276,3 +276,28 @@ class TestRevokeDelegationLinkConsole(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRevocationDiagnostics(unittest.TestCase):
+    """Revoking link 0 must not make link 1 emit a false "scope widens".
+
+    The deny is correct (link 0 revoked); the diagnostics must say why,
+    not invent a second reason. Fails on the pre-fix _verify_chain, which
+    skipped the prev_scope assignment on the revoked link's `continue`,
+    leaving link 1 compared against None.
+    """
+
+    def test_revoked_first_link_diagnostic_is_truthful(self):
+        w = World()
+        w.revoke_link(w.link0["revocation_handle"])
+        ok, reasons, _ev = _v2_verify(w, _v2_request(w), w.manifest())
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("link 0" in r and "delegation link revoked" in r
+                for r in reasons),
+            reasons)
+        # link 1 genuinely narrows link 0 (identical scopes): no widening
+        # reason may be emitted.
+        self.assertFalse(
+            any("link 1" in r and "scope widens" in r for r in reasons),
+            f"misleading diagnostic emitted: {reasons}")

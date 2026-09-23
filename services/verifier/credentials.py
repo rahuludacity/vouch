@@ -290,11 +290,16 @@ def _verify_chain(cred, now, revoked_link_handles=None):
         rh = link.get("revocation_handle")
         if rh and rh in revoked:
             reasons.append(f"link {i}: delegation link revoked")
-            continue
         if i > 0:
             _check(link.get("delegator_pubkey") ==
                    links[i - 1].get("delegatee_pubkey"), reasons,
                    f"link {i}: chain continuity broken")
+            # The narrowing diagnostic describes the signed chain: it is
+            # evaluated against the previous structurally-valid link's
+            # scope even when a link was revoked (revocation is its own
+            # independent deny). Skipping the assignment here used to make
+            # revoking link 0 emit a false "link 1: scope widens" because
+            # link 1 was compared against None.
             ok_n, why_n = scope_narrows(link.get("scope"), prev_scope)
             _check(ok_n, reasons, f"link {i}: scope widens ({why_n})")
         prev_scope = link.get("scope")
