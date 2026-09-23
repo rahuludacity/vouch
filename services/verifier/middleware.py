@@ -17,9 +17,15 @@ Security posture (reference implementations must be copy-safe):
     envelope, cache error, or missing credential routes to the challenge
     lane. Nothing here can produce an allow except a live allow decision
     from the verifier.
-  * The verdict cache is keyed by sha256 of the *canonical credential
-    bytes*, not by credential_id — a tampered signature with the same id
-    must not hit a cached allow.
+  * No positive caching: an "allow" is ALWAYS a live verifier decision.
+    Proof-of-possession is per-request — a cached allow would let a
+    stolen credential ride a cached verdict without a valid agent
+    signature, and it would blind the verifier's per-request
+    rate/spending accounting. Only deny/unreachable verdicts are cached
+    (short TTL), to absorb retry storms.
+  * The verdict cache is keyed by sha256 of the canonical envelope
+    bytes, not by credential_id — a tampered envelope cannot alias a
+    cached entry.
   * Credential envelopes are size-capped (64 KiB) before JSON parsing.
   * No credential material lands in metrics, verdict dicts, or logs.
   * serve() binds 127.0.0.1 only (demo/test helper, not a deployment
@@ -33,7 +39,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import secrets
 import time
 import urllib.parse
 import urllib.request
@@ -125,15 +130,43 @@ class _VerifierClient:
         self.timeout_s = timeout_s
 
     def verify(self, envelope: dict) -> dict:
-        """Submit a credential envelope; return
-        {"decision","lane","reason"}. Any transport/parse problem raises
-        VerifierUnreachable (fail-closed upstream)."""
+        """Submit the agent's signed request envelope; return
+        {"decision","lane","reason"}.
+
+        The envelope is the agent's own signed request for this access:
+        {"credential","action","nonce","ts","agent_signature"}. It is
+        forwarded AS-IS to the verifier (plus tenant_id) — the verifier
+        checks proof-of-possession against the agent's signature over the
+        agent's own nonce/ts. The client MUST NOT mint a fresh nonce/ts
+        here: that would break the agent's signature and every request
+        would deny at proof-of-possession. Any transport/parse problem,
+        or a malformed envelope, raises VerifierUnreachable (fail-closed
+        upstream).
+        """
+        if not isinstance(envelope, dict):
+            raise VerifierUnreachable("envelope is not an object")
+        credential = envelope.get("credential")
+        action = envelope.get("action")
+        nonce = envelope.get("nonce")
+        ts = envelope.get("ts")
+        agent_signature = envelope.get("agent_signature")
+        if not isinstance(credential, dict):
+            raise VerifierUnreachable("envelope has no credential object")
+        if not isinstance(action, dict):
+            raise VerifierUnreachable("envelope has no action object")
+        if not isinstance(nonce, str) or not nonce:
+            raise VerifierUnreachable("envelope has no nonce")
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            raise VerifierUnreachable("envelope has no numeric ts")
+        if not isinstance(agent_signature, str) or not agent_signature:
+            raise VerifierUnreachable("envelope has no agent_signature")
         body = json.dumps({
             "tenant_id": "default",
-            "credential": envelope,
-            "action": {"type": "middleware.page_access"},
-            "nonce": secrets.token_hex(16),
-            "ts": int(time.time()),
+            "credential": credential,
+            "action": action,
+            "nonce": nonce,
+            "ts": ts,
+            "agent_signature": agent_signature,
         }).encode("utf-8")
         request = urllib.request.Request(
             self.verify_url, data=body,
@@ -178,13 +211,15 @@ def _canonical_credential_bytes(envelope: dict) -> bytes:
 
 
 class VerdictCache:
-    """Short-TTL cache of verifier decisions, keyed by credential content.
+    """Short-TTL cache of verifier decisions, keyed by envelope content.
 
-    Positive (allow) entries live ``ttl_s``; negative entries (deny, or
-    unreachable) live the shorter ``negative_ttl_s`` so a transient
-    outage or a revoked-then-fixed credential recovers quickly. Size is
-    capped (oldest entries evicted first) to bound memory. Only the
-    decision/lane/reason are stored — never the credential itself.
+    Non-allow decisions are stored with the short ``negative_ttl_s`` so a
+    transient outage or a retried bad credential does not hammer the
+    verifier; the class can technically store allows with ``ttl_s``, but
+    VouchMiddleware deliberately never does (see _verify_agent: an allow
+    must always be a live verifier decision). Size is capped (oldest
+    entries evicted first) to bound memory. Only the decision/lane/reason
+    are stored — never the credential itself.
     """
 
     def __init__(self, ttl_s=60, negative_ttl_s=10, max_entries=10000):
@@ -303,6 +338,14 @@ class VouchMiddleware:
         Never raises: any cache/verifier failure returns the challenge
         lane (fail-closed). The verifier's decision is the only path to
         the agent lane.
+
+        Deliberately NO positive caching: an "allow" is always a live
+        verifier decision. Proof-of-possession is per-request — a cached
+        allow would let a stolen credential ride a cached verdict without
+        a valid agent signature, and it would blind the verifier's
+        per-request rate/spending accounting. Only deny/unreachable
+        verdicts are cached (short TTL), so a retry storm does not hammer
+        a downed verifier.
         """
         try:
             cached = self._cache.get(envelope)
@@ -310,22 +353,27 @@ class VouchMiddleware:
             cached = None
         if cached is not None:
             decision, lane, reason = cached
-        else:
+            # The cache only ever holds non-allow verdicts (see below);
+            # anything cached routes to the challenge lane.
+            return "challenge", decision, reason
+        try:
+            result = self._verifier.verify(envelope)
+        except Exception:
+            # Fail closed on unreachable/misbehaving verifier — and
+            # remember the negative verdict briefly so a retry storm
+            # does not hammer a downed verifier.
             try:
-                result = self._verifier.verify(envelope)
+                self._cache.put(envelope, "unreachable", "",
+                                "verifier unreachable")
             except Exception:
-                # Fail closed on unreachable/misbehaving verifier — and
-                # remember the negative verdict briefly so a retry storm
-                # does not hammer a downed verifier.
-                try:
-                    self._cache.put(envelope, "unreachable", "",
-                                    "verifier unreachable")
-                except Exception:
-                    pass
-                return "challenge", "unreachable", "verifier unreachable"
-            decision = result.get("decision", "deny")
-            lane = result.get("lane", "")
-            reason = result.get("reason", "")
+                pass
+            return "challenge", "unreachable", "verifier unreachable"
+        decision = result.get("decision", "deny")
+        lane = result.get("lane", "")
+        reason = result.get("reason", "")
+        if decision != "allow":
+            # Negative verdicts only (see docstring): cache briefly so a
+            # retry storm does not hammer the verifier on every request.
             try:
                 self._cache.put(envelope, decision, lane, reason)
             except Exception:

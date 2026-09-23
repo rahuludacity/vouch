@@ -2,8 +2,9 @@
 
 Covers: classify() precedence, the WSGI branch lanes with a stub
 verifier (no network), fail-closed behavior on every error path, the
-verdict cache (content-keyed, tampered-signature miss, negative TTL),
-and serve() over real loopback HTTP.
+verdict cache (negative-only: allows are always live decisions),
+the verifier_client envelope-forwarding contract against a loopback
+server, and serve() over real loopback HTTP.
 
 No external network: the stub verifier replaces verifier_client, and
 serve() is exercised over 127.0.0.1 only.
@@ -28,6 +29,7 @@ from services.verifier.middleware import (  # noqa: E402
     VouchMiddleware,
     classify,
     serve,
+    verifier_client,
 )
 
 
@@ -286,7 +288,10 @@ class TestMiddlewareLanes(unittest.TestCase):
 # ------------------------------------------------------------------- cache
 
 class TestVerdictCache(unittest.TestCase):
-    def test_second_identical_request_hits_cache(self):
+    def test_allow_is_never_cached(self):
+        # Security rule: an allow must always be a live verifier decision
+        # (proof-of-possession is per-request). Two identical requests ->
+        # the verifier is consulted twice.
         stub = StubVerifier()
         stub.allow(_cred())
         app = _mw(verifier=stub)
@@ -295,9 +300,9 @@ class TestVerdictCache(unittest.TestCase):
         _run(app, env())
         status, _, body = _run(app, env())
         self.assertEqual(body, b"AGENT")
-        self.assertEqual(len(stub.calls), 1)
+        self.assertEqual(len(stub.calls), 2)
 
-    def test_tampered_signature_does_not_hit_allow_cache(self):
+    def test_tampered_envelope_is_denied_live(self):
         stub = StubVerifier()
         stub.allow(_cred())  # allow only the original bytes
         app = _mw(verifier=stub)
@@ -309,8 +314,9 @@ class TestVerdictCache(unittest.TestCase):
                          _cred(signature="sig-TAMPERED"))})
         _run(app, good)
         status, _, body = _run(app, tampered)
-        # same credential_id, different signature bytes -> cache miss ->
-        # stub denies the tampered envelope -> challenge
+        # same credential_id, different signature bytes -> the stub does
+        # not recognize it -> deny -> challenge (and the good one was a
+        # live allow, never cached)
         self.assertEqual(body, b"CHALLENGE")
         self.assertEqual(len(stub.calls), 2)
 
@@ -330,13 +336,13 @@ class TestVerdictCache(unittest.TestCase):
             self.assertEqual(len(stub.calls), 1)
             _run(app, env())  # within negative TTL -> cached deny
             self.assertEqual(len(stub.calls), 1)
-            now[0] += 11  # past negative TTL, within positive TTL
+            now[0] += 11  # past negative TTL
             _run(app, env())
             self.assertEqual(len(stub.calls), 2)
         finally:
             mwmod.time.time = real_time
 
-    def test_positive_cache_outlives_negative_ttl(self):
+    def test_allow_still_live_after_negative_ttl_passes(self):
         import services.verifier.middleware as mwmod
         real_time = mwmod.time.time
         now = [2_000_000.0]
@@ -352,19 +358,141 @@ class TestVerdictCache(unittest.TestCase):
             _run(app, env())
             now[0] += 11  # past negative TTL
             _run(app, env())
-            self.assertEqual(len(stub.calls), 1)  # positive still cached
+            # allows are never cached: the verifier is consulted again
+            self.assertEqual(len(stub.calls), 2)
         finally:
             mwmod.time.time = real_time
 
     def test_cache_size_cap_evicts_oldest(self):
         cache = VerdictCache(ttl_s=60, negative_ttl_s=10, max_entries=3)
         for i in range(5):
-            cache.put(_cred(credential_id=f"c{i}"), "allow",
-                      "verified-agent", "ok")
+            cache.put(_cred(credential_id=f"c{i}"), "deny",
+                      "unverified", "nope")
         self.assertLessEqual(len(cache._entries), 3)
         # newest entries survive, oldest evicted
         self.assertIsNotNone(cache.get(_cred(credential_id="c4")))
         self.assertIsNone(cache.get(_cred(credential_id="c0")))
+
+
+def _signed_envelope(**kw):
+    """A full agent-signed request envelope (what X-Vouch-Credential
+    carries in a real deployment)."""
+    env = {
+        "credential": _cred(),
+        "action": {"type": "middleware.page_access"},
+        "nonce": "n-123",
+        "ts": 1_700_000_000,
+        "agent_signature": "sig-agent-abc",
+    }
+    env.update(kw)
+    return env
+
+
+class TestVerifierClient(unittest.TestCase):
+    """The reference client must forward the agent's signed envelope
+    AS-IS. Re-wrapping it with a fresh nonce/ts would break the agent's
+    proof-of-possession signature and deny every real request."""
+
+    def _server(self, handler):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("Content-Length", 0))
+                handler.received = json.loads(
+                    self.rfile.read(length).decode("utf-8"))
+                body = json.dumps(handler.reply).encode("utf-8")
+                self.send_response(handler.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    def test_forwards_signed_envelope_as_is(self):
+        class H:
+            received = None
+            status = 200
+            reply = {"decision": "allow", "lane": "verified-agent",
+                     "reason": "ok"}
+        srv = self._server(H)
+        try:
+            client = verifier_client(
+                f"http://127.0.0.1:{srv.server_address[1]}")
+            env = _signed_envelope()
+            out = client.verify(env)
+            self.assertEqual(out["decision"], "allow")
+            self.assertEqual(out["lane"], "verified-agent")
+            # The agent's own fields arrive untouched — NOT re-wrapped
+            # with a fresh nonce/ts.
+            self.assertEqual(H.received["credential"], env["credential"])
+            self.assertEqual(H.received["action"], env["action"])
+            self.assertEqual(H.received["nonce"], "n-123")
+            self.assertEqual(H.received["ts"], 1_700_000_000)
+            self.assertEqual(H.received["agent_signature"],
+                             "sig-agent-abc")
+            self.assertEqual(H.received["tenant_id"], "default")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_malformed_envelope_raises_before_any_http(self):
+        class H:
+            received = None
+            status = 200
+            reply = {"decision": "allow", "lane": "verified-agent",
+                     "reason": "ok"}
+        srv = self._server(H)
+        try:
+            client = verifier_client(
+                f"http://127.0.0.1:{srv.server_address[1]}")
+            bad = _signed_envelope()
+            del bad["agent_signature"]
+            with self.assertRaises(VerifierUnreachable):
+                client.verify(bad)
+            self.assertIsNone(H.received)  # no request was sent
+            with self.assertRaises(VerifierUnreachable):
+                client.verify("not-a-dict")
+            self.assertIsNone(H.received)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_verifier_error_raises_unreachable(self):
+        class H:
+            received = None
+            status = 500
+            reply = {"error": "boom"}
+        srv = self._server(H)
+        try:
+            client = verifier_client(
+                f"http://127.0.0.1:{srv.server_address[1]}")
+            with self.assertRaises(VerifierUnreachable):
+                client.verify(_signed_envelope())
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_verifier_nonsense_body_raises_unreachable(self):
+        class H:
+            received = None
+            status = 200
+            reply = {"surprise": "no decision here"}
+        srv = self._server(H)
+        try:
+            client = verifier_client(
+                f"http://127.0.0.1:{srv.server_address[1]}")
+            with self.assertRaises(VerifierUnreachable):
+                client.verify(_signed_envelope())
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 # ------------------------------------------------------------------- serve
