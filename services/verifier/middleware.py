@@ -134,14 +134,17 @@ class _VerifierClient:
         {"decision","lane","reason"}.
 
         The envelope is the agent's own signed request for this access:
-        {"credential","action","nonce","ts","agent_signature"}. It is
-        forwarded AS-IS to the verifier (plus tenant_id) — the verifier
-        checks proof-of-possession against the agent's signature over the
-        agent's own nonce/ts. The client MUST NOT mint a fresh nonce/ts
-        here: that would break the agent's signature and every request
-        would deny at proof-of-possession. Any transport/parse problem,
-        or a malformed envelope, raises VerifierUnreachable (fail-closed
-        upstream).
+        {"credential","action","nonce","ts","agent_signature"} plus,
+        optionally, "principal_approval" (a principal-signed approval for
+        prepare-mode effect actions, PRD §3). It is forwarded AS-IS to the
+        verifier (plus tenant_id) — the verifier checks proof-of-possession
+        against the agent's signature over the agent's own nonce/ts, and
+        the verifier (never this client) checks the approval's signature,
+        binding, expiry, and single-use. The client MUST NOT mint a fresh
+        nonce/ts here: that would break the agent's signature and every
+        request would deny at proof-of-possession. Any transport/parse
+        problem, or a malformed envelope, raises VerifierUnreachable
+        (fail-closed upstream).
         """
         if not isinstance(envelope, dict):
             raise VerifierUnreachable("envelope is not an object")
@@ -160,14 +163,24 @@ class _VerifierClient:
             raise VerifierUnreachable("envelope has no numeric ts")
         if not isinstance(agent_signature, str) or not agent_signature:
             raise VerifierUnreachable("envelope has no agent_signature")
-        body = json.dumps({
+        body = {
             "tenant_id": "default",
             "credential": credential,
             "action": action,
             "nonce": nonce,
             "ts": ts,
             "agent_signature": agent_signature,
-        }).encode("utf-8")
+        }
+        # H-3 gap closure: forward the principal-signed approval when the
+        # agent attached one. It rides outside the agent-signed envelope
+        # (the agent cannot mint it, only attach it); the verifier checks
+        # its signature/binding/expiry/single-use. A prepare-mode effect
+        # action arriving without one still fails closed at the verifier,
+        # exactly as before — this client cannot mint or alter approvals.
+        approval = envelope.get("principal_approval")
+        if approval is not None:
+            body["principal_approval"] = approval
+        body = json.dumps(body).encode("utf-8")
         request = urllib.request.Request(
             self.verify_url, data=body,
             headers={"Content-Type": "application/json"}, method="POST")
