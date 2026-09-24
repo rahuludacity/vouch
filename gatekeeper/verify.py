@@ -21,7 +21,7 @@ PATH = os.environ.get(
 registry = TenantRegistry(TENANTS_PATH)
 ok, failures = ReceiptLog(PATH, registry).verify()
 if ok:
-    print("RECEIPTS VERIFIED: chain intact, all signatures valid.")
+    print("VERIFIED ACTIONS: chain intact, all signatures valid.")
 else:
     print("RECEIPT VERIFICATION FAILED:")
     for f in failures:

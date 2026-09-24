@@ -9,7 +9,7 @@ Three lanes:
                       ts, agent_signature} -> the site asks the verifier
                       (POST /v1/verify). allow -> the submission is
                       processed fast, and the decision lands in the
-                      transparency log as a signed, hash-chained receipt.
+                      transparency log as a signed, hash-chained verification record.
   unverified lane     missing/invalid credential -> 429 + a challenge URL.
                       This is the status-quo path (CAPTCHA / proof-of-work
                       stand-in): bots get stuck here instead of eating the
@@ -208,7 +208,7 @@ request was accepted. (Humans pass through unchanged; no credential needed.)</p>
                     "lane": "verified-agent",
                     "receipt_seq": decision.get("receipt_seq"),
                     "receipt_hash": decision.get("receipt_hash"),
-                    "message": "verified agent: fast passage, action receipted"})
+                    "message": "verified agent: fast passage — verified action recorded"})
             else:
                 self._challenge(
                     f"credential rejected: {decision.get('reason')}")

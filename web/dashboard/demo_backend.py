@@ -8,7 +8,7 @@ process so the /demo page can trigger each lane live:
   * demo site (demo/agent_verification/site.py, "Smallville Permit Office")
     on 127.0.0.1:$DEMO_SITE_PORT
 
-Every number the /demo page shows comes from a live call: receipt seq/hash
+Every number the /demo page shows comes from a live call: verification-record seq/hash
 from the site's real /agent-submit response, deny reasons from the real 429
 body, challenged counts from real bot responses, lane counters from the
 site's live /stats, and chain verification from running gatekeeper.verify
